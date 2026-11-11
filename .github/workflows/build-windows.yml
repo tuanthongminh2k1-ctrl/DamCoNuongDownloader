@@ -1,5 +1,5 @@
 
-name: Tao EXE TruyenPDF CocCoc v4
+name: Tao EXE TruyenSaver CocCoc Offline v1.1
 
 on:
   workflow_dispatch:
@@ -10,26 +10,44 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Checkout source
+      - name: Lay ma nguon
         uses: actions/checkout@v4
 
-      - name: Set up Python on GitHub runner
+      - name: Cai Python tren may chu GitHub
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install build dependencies
+      - name: Cai thu vien
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install playwright pypdf pyinstaller
+          python -m pip install "playwright>=1.54,<2" "pywinauto>=0.6.9,<1" "pywin32>=306" "psutil>=6,<8" "pyinstaller>=6.10,<7"
 
-      - name: Build standalone GUI EXE
+      - name: Kiem tra code
+        shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name TruyenPDF_CocCoc --collect-all playwright app.py
+          python -m py_compile app.py
+          if (Test-Path tests) {
+            python -m unittest discover -s tests -v
+          }
 
-      - name: Upload Windows app
+      - name: Tao file EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name TruyenSaver_CocCoc --collect-all playwright --collect-submodules playwright --collect-all pywinauto --hidden-import=pythoncom --hidden-import=win32gui --hidden-import=win32con --hidden-import=win32process app.py
+
+      - name: Kiem tra EXE
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist/TruyenSaver_CocCoc.exe')) {
+            throw 'EXE missing'
+          }
+
+      - name: Dang file EXE
         uses: actions/upload-artifact@v4
         with:
-          name: TruyenPDF-CocCoc-Windows
-          path: dist/TruyenPDF_CocCoc.exe
-          retention-days: 7
+          name: TruyenSaver-CocCoc-Offline-Windows
+          path: dist/TruyenSaver_CocCoc.exe
+          retention-days: 14
+          if-no-files-found: error
