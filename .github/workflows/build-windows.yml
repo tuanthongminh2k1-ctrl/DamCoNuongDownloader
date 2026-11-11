@@ -1,5 +1,5 @@
 
-name: Tao EXE TruyenSaver PRO v3.0
+name: Tao EXE TruyenSaver PRO v3.1
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
       - name: Get source
         uses: actions/checkout@v4
 
-      - name: Install Python on GitHub runner
+      - name: Install Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -38,40 +38,47 @@ jobs:
             throw 'Chromium missing'
           }
 
-      - name: Check source and tests
+      - name: Test code
         shell: pwsh
         run: |
           python -m py_compile app.py
-          if (Test-Path 'tests/test_v3_features.py') {
+          if (Test-Path 'tests/test_v31_regressions.py') {
             python -m unittest discover -s tests -p 'test_*.py' -v
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Tests failed'
+            }
+            python tests/check_stop_real_browser.py
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Browser STOP test failed'
+            }
           }
 
       - name: Build EXE
         shell: pwsh
         run: |
           $browsers = Join-Path $env:GITHUB_WORKSPACE 'playwright-browsers'
-          python -m PyInstaller --noconfirm --clean --onedir --windowed --name TruyenSaver_PRO_v3 --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf --add-data "$browsers;playwright-browsers" app.py
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name TruyenSaver_PRO_v3_1 --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf --add-data "$browsers;playwright-browsers" app.py
 
-      - name: Verify EXE and browser
+      - name: Verify EXE
         shell: pwsh
         run: |
-          $dir = 'dist/TruyenSaver_PRO_v3'
-          if (-not (Test-Path "$dir/TruyenSaver_PRO_v3.exe")) {
+          $dir = 'dist/TruyenSaver_PRO_v3_1'
+          if (-not (Test-Path "$dir/TruyenSaver_PRO_v3_1.exe")) {
             throw 'EXE missing'
           }
           if (-not (Test-Path "$dir/_internal/playwright-browsers")) {
-            throw 'Browser missing'
+            throw 'Chromium missing'
           }
-          $exe = (Resolve-Path "$dir/TruyenSaver_PRO_v3.exe").Path
+          $exe = (Resolve-Path "$dir/TruyenSaver_PRO_v3_1.exe").Path
           $test = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
           if ($test.ExitCode -ne 0) {
-            throw "EXE self-test failed: $($test.ExitCode)"
+            throw 'EXE self-test failed'
           }
 
-      - name: Upload portable app
+      - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: TruyenSaver-PRO-v3-Windows-Portable
-          path: dist/TruyenSaver_PRO_v3/
+          name: TruyenSaver-PRO-v3.1-Windows-Portable
+          path: dist/TruyenSaver_PRO_v3_1/
           retention-days: 14
           if-no-files-found: error
