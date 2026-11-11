@@ -1,4 +1,4 @@
-"""TruyenSaver Cốc Cốc Offline v2.1 – standalone source for Windows EXE.
+"""TruyenSaver Chromium Offline v2.4 – portable Windows application.
 
 This app uses CDP to save MHTML, NOT Ctrl+S HTML+_files.
 No Python is required on the Windows machine *after* GitHub builds the EXE.
@@ -22,7 +22,8 @@ from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
-VERSION = '2.1.0'
+VERSION = '2.4.0'
+PDF_RENDER_VERSION = 'long-pages-no-splits-v1'
 SUPPORTED_HOSTS = ('damconuong.cool', 'sayhentai.cx')
 CHAPTER_RE = re.compile(r'(?:chap(?:ter)?|chương|chuong)\s*[:#\-_. ]*\s*(\d+(?:[.,]\d+)?)', re.I)
 
@@ -176,11 +177,13 @@ def read_manifest(folder: Path) -> dict:
         return {}
 
 
-def write_manifest_entry(folder: Path, chapter: str, url: str, file: Path, expected: int, matched: int):
+def write_manifest_entry(folder: Path, chapter: str, url: str, file: Path, expected: int, matched: int,
+                         reader_urls: list[str] | None = None):
     folder.mkdir(parents=True, exist_ok=True)
     data = read_manifest(folder)
     data[chapter] = {'url': url, 'file': file.name, 'size': file.stat().st_size,
                      'version': VERSION, 'expected': expected, 'matched': matched,
+                     'reader_urls': reader_urls or [],
                      'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')}
     tmp = manifest_path(folder).with_suffix('.json.tmp')
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
@@ -190,7 +193,7 @@ def write_manifest_entry(folder: Path, chapter: str, url: str, file: Path, expec
 def completed(folder: Path, chapter: str, url: str, file: Path) -> bool:
     entry = read_manifest(folder).get(chapter)
     return (isinstance(entry, dict) and entry.get('url') == url
-            and entry.get('version') in ('2.0.0', VERSION) and entry.get('file') == file.name
+            and entry.get('version') in ('2.0.0', '2.1.0', '2.2.0', '2.3.0', VERSION) and entry.get('file') == file.name
             and entry.get('expected', 0) > 0
             and entry.get('expected') == entry.get('matched')
             and file.is_file() and file.stat().st_size > 1500
@@ -215,7 +218,9 @@ def write_index(folder: Path, series: str, chapters: list[dict]) -> None:
     path.write_text(page, encoding='utf-8')
 
 
-# Browser-side reader analysis. Never include ads outside the selected reading container.
+# Browser-side reader analysis. Do not use the WHOLE DOCUMENT bottom as the
+# condition for reader completion. Ad slots, comments and infinite-scroll widgets
+# can change the page height indefinitely even when all 35/35 comic pages are ready.
 READER_JS = r'''() => {
  const selectors=['.reading-detail','.chapter-content','.page-chapter','.viewer-content',
  '.reading-content','#chapter-content','#chapter-reading-content','.container-chapter-reader',
@@ -233,8 +238,7 @@ READER_JS = r'''() => {
  choices.sort((a,b)=> a.index-b.index || b.imgs.length-a.imgs.length);
  let selected=choices[0];
  if (!selected) return {selector:'',total:0,ready:0,missing:0,valid:0,
-      images:[],height:document.documentElement.scrollHeight,
-      bottom:scrollY+innerHeight>=document.documentElement.scrollHeight-18};
+      images:[],readerEnd:false,scrollY,viewport:innerHeight};
  let images=selected.imgs.map((i,idx)=>{
    if(!i.dataset.truyensaverId) i.dataset.truyensaverId='ts-'+idx;
    let current=i.currentSrc||i.src||'';
@@ -242,16 +246,27 @@ READER_JS = r'''() => {
    const placeholder=(!current || current.startsWith('data:image/svg') ||
      /(?:placeholder|loading|spacer|lazy\.gif)/i.test(current));
    let desired=(placeholder&&deferred)?new URL(deferred,location.href).href:current;
-   // A very small successfully loaded pixel is usually a tracker or placeholder.
    const ready=Boolean(i.complete&&i.naturalWidth>=32&&i.naturalHeight>=32&&!placeholder);
    return {key:i.dataset.truyensaverId,src:desired,ready,width:i.naturalWidth||0,
      height:i.naturalHeight||0,pending:placeholder,top:Math.round(i.getBoundingClientRect().top+scrollY)};
- }).filter(i=>i.src && (i.width>=16||i.height>=16||!i.ready) && !/\/(?:banner|advert|ads?)[\/_-]|(?:logo|avatar|tracking|pixel)\.(?:jpg|png|gif|webp)/i.test(i.src));
+ }).filter(i=>i.src && (i.width>=16||i.height>=16||!i.ready) &&
+    !/\/(?:banner|advert|ads?)[\/_-]|(?:logo|avatar|tracking|pixel)\.(?:jpg|png|gif|webp)/i.test(i.src));
+ // Reader-tail means the end of the LAST IMAGE, not the end of the entire page.
+ // For long-strip manga, the last image can be much taller than the viewport.
+ const chosenKeys=new Set(images.map(x=>x.key));
+ let last=null;
+ for(const element of selected.imgs) {
+   if(chosenKeys.has(element.dataset.truyensaverId)) last=element;
+ }
+ const lastBottom=last?last.getBoundingClientRect().bottom:selected.el.getBoundingClientRect().bottom;
+ const top=last?last.getBoundingClientRect().top:0;
+ const scrollRoot=document.scrollingElement||document.documentElement;
+ const canScrollFurther=(scrollRoot.scrollTop+innerHeight < scrollRoot.scrollHeight-15);
+ const readerEnd=Boolean(last&&(lastBottom<=innerHeight+100 || (!canScrollFurther&&top<innerHeight)));
  return {selector:selected.sel,total:images.length,ready:images.filter(i=>i.ready).length,
  missing:images.filter(i=>!i.ready).length,valid:images.filter(i=>i.ready).length,
- images,height:document.documentElement.scrollHeight,
- bottom:scrollY+innerHeight>=document.documentElement.scrollHeight-18,
- viewport:innerHeight};
+ images,readerEnd,scrollY,viewport:innerHeight,readerTail:Math.round(lastBottom),
+ documentHeight:scrollRoot.scrollHeight};
 }'''
 
 # Trigger in-page loading without synthesizing keyboard/mouse input.
@@ -267,102 +282,155 @@ EAGER_JS = r'''() => {
 }'''
 
 
-def wait_for_reader(page, log, stop, max_seconds=155) -> dict:
-    """Load lazy reader images, retry delayed images and collect all observed URLs.
+def reader_signature(info: dict) -> tuple:
+    '''Only image identities and their readiness matter for settling the reader.
 
-    This cannot prove a server didn't hide additional pages. It only validates the
-    images exposed in the reading DOM; the MHTML check must run afterwards.
-    """
-    end = time.monotonic() + max_seconds
-    seen: set[str] = set()
-    last = {}
+    Do NOT include documentHeight. A moving advertisement below the chapter must
+    never prevent a 35/35 successfully-loaded reader from completing.
+    '''
+    return (tuple((x['key'], normalize_url(x['src']), bool(x['ready']))
+                  for x in info.get('images', [])))
+
+
+def ready_to_archive(info: dict, seen_reader_tail: bool, stable_seconds: float) -> bool:
+    '''Pure, testable completion gate: all discovered comic images and reader tail.'''
+    return bool(info.get('selector') and info.get('total', 0) > 0
+                and info.get('missing', 1) == 0
+                and seen_reader_tail and stable_seconds >= 3.0)
+
+
+def _scroll_to_last_reader_image(page) -> None:
+    page.evaluate('''() => {
+      let imgs=[...document.querySelectorAll('img[data-truyensaver-id]')];
+      if(imgs.length) imgs[imgs.length-1].scrollIntoView({block:'end',behavior:'instant'});
+    }''')
+
+
+def wait_for_reader(page, log, stop, max_seconds=155) -> dict:
+    '''Two-stage check: traverse every reader image, then settle the IMAGE list.
+
+    A footer/advertisement/infinite-scroll region must not hold the reader
+    hostage. This only checks images actually exposed by the website and is not
+    proof that the server did not hide more pages.
+    '''
+    deadline = time.monotonic() + max_seconds
+    last: dict = {}
+    diagnostic = 'unknown'
+    # Retry only when there are broken/lazy images; don't wait ~190 seconds if
+    # every observed reader image is loaded and the reader itself has been seen.
     for attempt in range(3):
         if stop.is_set():
             raise InterruptedError('Đã yêu cầu dừng')
         page.evaluate('window.scrollTo(0,0)')
         page.evaluate(EAGER_JS)
-        max_total = 0
-        last_observed = None
+        discovered = False
+        reader_tail_seen = False
+        last_signature = None
         stable_since = None
-        last_progress = None
-        progress_time = time.monotonic()
-        # Use progressively slower passes; the first pass is intentionally fast.
-        pause = (0.10, 0.26, 0.45)[attempt]
+        last_reader_y = None
+        no_move = 0
         steps = 0
-        while time.monotonic() < end and steps < 900:
+        # A second pass after the initial sweep covers lazy-loaded images that
+        # appear at the tail when entering the reader for the first time.
+        while time.monotonic() < deadline and steps < 850:
             if stop.is_set():
                 raise InterruptedError('Đã yêu cầu dừng')
             info = page.evaluate(READER_JS)
             last = info
             if not info['selector']:
-                # Some sites render reader nodes after document ready.
-                page.wait_for_timeout(500)
-                steps += 1
-                if steps > 28:
+                if steps > 25:
                     break
+                page.wait_for_timeout(350)
+                steps += 1
                 continue
-            for img in info['images']:
-                if img['src']:
-                    seen.add(normalize_url(img['src']))
-            max_total = max(max_total, info['total'])
-            signature = (info['total'], info['ready'], info['height'], len(seen))
-            progress = (info['total'], info['ready'], len(seen))
-            if progress != last_progress:
-                progress_time = time.monotonic()
-                last_progress = progress
-            if info['bottom'] and info['total'] > 0 and info['missing'] == 0 and signature == last_observed:
-                if stable_since is None:
-                    stable_since = time.monotonic()
-                if time.monotonic() - stable_since >= 3.0:
-                    urls = list(dict.fromkeys(normalize_url(x['src']) for x in info['images']))
-                    if len(urls) == max_total :
-                        log(f"    Ảnh vùng đọc đã ổn định: {info['ready']}/{info['total']} (lượt {attempt+1}).")
-                        return {'urls': urls, 'total': len(urls), 'selector': info['selector']}
-            else:
+            discovered = True
+            if info['readerEnd']:
+                reader_tail_seen = True
+            sig = reader_signature(info)
+            if sig != last_signature:
+                stable_since = time.monotonic()
+            last_signature = sig
+            stable_seconds = time.monotonic() - stable_since if stable_since else 0
+            # A full top-to-reader-tail sweep was already performed. Do a brief
+            # independent recheck of the final reader image instead of making a
+            # second full sweep (which can be slow on long webtoons).
+            if ready_to_archive(info, reader_tail_seen, stable_seconds):
+                page.evaluate(EAGER_JS)
+                _scroll_to_last_reader_image(page)
+                page.wait_for_timeout(300)
+                confirm = page.evaluate(READER_JS)
+                if (confirm['readerEnd'] and confirm['missing'] == 0
+                        and reader_signature(confirm) == sig):
+                    urls = list(dict.fromkeys(normalize_url(x['src']) for x in confirm['images']))
+                    if not urls:
+                        raise RuntimeError('Không tìm thấy URL ảnh truyện hợp lệ.')
+                    log(f"    Ảnh truyện đã đủ, ổn định: {confirm['ready']}/{confirm['total']}; "
+                        f"đã kiểm tra lại đuôi vùng đọc (lượt {attempt+1}).")
+                    return {'urls': urls, 'total': len(urls), 'selector': confirm['selector']}
                 stable_since = None
-            last_observed = signature
-            if info['bottom'] and info['missing'] and time.monotonic()-progress_time > 6 + attempt*3:
-                break  # Try scrolling directly to failed images instead of waiting for full timeout.
-            if not info['bottom']:
-                page.evaluate('window.scrollBy(0,Math.max(350,Math.floor(innerHeight*0.83)))')
-                page.wait_for_timeout(round(pause * 1000))
+            # Read the last image, not the ever-growing footer. At the reader's
+            # last image, wait for counts and URLs to settle without scrolling.
+            if info['readerEnd']:
+                page.wait_for_timeout(220)
             else:
-                page.wait_for_timeout(380)
+                current_y = info['scrollY']
+                if current_y == last_reader_y:
+                    no_move += 1
+                else:
+                    no_move = 0
+                last_reader_y = current_y
+                if no_move >= 3:
+                    # Handles scroll containers and pages with huge footers.
+                    _scroll_to_last_reader_image(page)
+                    page.wait_for_timeout(300)
+                    no_move = 0
+                else:
+                    page.evaluate('window.scrollBy(0,Math.max(420,Math.floor(innerHeight*0.94)))')
+                    page.wait_for_timeout((85, 150, 240)[attempt])
             steps += 1
-        if not last.get('selector'):
+            # If the reader itself is loaded but a few images are broken, don't
+            # use the whole remaining budget to stare at the same missing image.
+            if info['readerEnd'] and info['missing'] > 0 and stable_seconds >= 7:
+                break
+        if not discovered:
             raise RuntimeError('Không tìm thấy vùng đọc truyện. Trang có thể cần đăng nhập hoặc cấu trúc website đã đổi.')
-        if time.monotonic() >= end:
+        diagnostic = (f"{last.get('ready',0)}/{last.get('total',0)} ảnh; "
+                      f"đã đến cuối vùng đọc: {'có' if reader_tail_seen else 'chưa'}")
+        if time.monotonic() >= deadline:
             break
-        missing = [i for i in last['images'] if not i['ready']]
-        log(f"    Lượt {attempt+1}: ảnh {last['ready']}/{last['total']}; "
-            f"{len(missing)} ảnh còn chờ. Đang thử cuộn tới ảnh lỗi...")
-        # Recovery: scroll to each pending image in turn, trigger lazy-load.
-        for i in missing[:150]:
+        missing = [i for i in last.get('images', []) if not i['ready']]
+        log(f"    Lượt {attempt+1}: {diagnostic}; "
+            f"{len(missing)} ảnh chưa xong. Đang quét lại vùng đọc...")
+        # Retry specific lazy/broken images, with per-image viewport activation.
+        for image in missing[:150]:
             if stop.is_set():
                 raise InterruptedError('Đã yêu cầu dừng')
-            if time.monotonic() >= end:
+            if time.monotonic() >= deadline:
                 break
             try:
                 page.evaluate('''key => {
                  const el=[...document.querySelectorAll('img')].find(i=>i.dataset.truyensaverId===key);
                  if(el) { el.scrollIntoView({block:'center'}); el.loading='eager'; }
-                }''', i['key'])
-                page.wait_for_timeout(350 + attempt * 270)
+                }''', image['key'])
+                page.wait_for_timeout(270 + attempt * 230)
             except Exception:
                 pass
         page.evaluate(EAGER_JS)
-        page.wait_for_timeout(750)
-    raise RuntimeError(f"Ảnh tải chưa đủ hoặc không ổn định: "
-                       f"{last.get('ready',0)}/{last.get('total',0)}. "
-                       f"Từ chối lưu để tránh thiếu ảnh; có thể cần đăng nhập hoặc ảnh lỗi máy chủ.")
+        _scroll_to_last_reader_image(page)
+        page.wait_for_timeout(500)
+    # Clear diagnostic makes 35/35-but-unstable distinct from missing 3/35.
+    raise RuntimeError(f'Không thể xác nhận đủ ảnh truyện ({diagnostic}). '
+                       'Không lưu chap chưa xác minh; kiểm tra trang có cần đăng nhập, '
+                       'có ảnh hỏng hoặc ảnh bị ẩn hay không.')
 
 
 # ---- Windows UI and browser controller ----
 
-"""TruyenSaver Cốc Cốc Offline 2.1 (Windows).
+"""TruyenSaver Chromium Offline 2.4 (Windows).
 
-Controls a *private* Cốc Cốc browser profile through CDP. This does not send
-keyboard/mouse input to the desktop. It saves MHTML, not Ctrl+S HTML+_files.
+Runs a bundled Chromium using a private persistent profile through CDP.
+No desktop keyboard or mouse simulation, no Chromium installation required.
+Stores MHTML snapshots rather than Ctrl+S HTML plus _files.
 """
 
 import json
@@ -381,20 +449,42 @@ from urllib.request import urlopen
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+APP_NAME = 'TruyenSaver Chromium Offline'
+CONFIG_DIR = Path(os.getenv('APPDATA') or Path.home()) / 'TruyenSaverChromium'
+PROFILE_DIR = CONFIG_DIR / 'Profile_v2_3'
+SETTINGS = CONFIG_DIR / 'settings_v2_3.json'
+LEGACY_SETTINGS = Path(os.getenv('APPDATA') or Path.home()) / 'TruyenSaverCocCoc' / 'settings_v2.json'
 
-APP_NAME = 'TruyenSaver Cốc Cốc Offline'
-CONFIG_DIR = Path(os.getenv('APPDATA') or Path.home()) / 'TruyenSaverCocCoc'
-PROFILE_DIR = CONFIG_DIR / 'Profile_v2'  # Reuse v2 login/session cookies
-SETTINGS = CONFIG_DIR / 'settings_v2.json'  # Continue v2 preferences
+
+def configure_chromium_path():
+    """Point Playwright at the browser included next to the portable EXE."""
+    frozen_root = getattr(sys, '_MEIPASS', None)
+    if frozen_root:
+        embedded = Path(frozen_root) / 'playwright-browsers'
+        if not embedded.is_dir():
+            raise RuntimeError('Bộ Chromium đi kèm bị thiếu. Hãy giải nén TOÀN BỘ thư mục ZIP, '
+                               'không di chuyển riêng file EXE.')
+        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(embedded)
 
 
-def find_coccoc() -> str:
-    candidates = []
-    for key in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA'):
-        base = os.getenv(key)
-        if base:
-            candidates.append(Path(base) / 'CocCoc' / 'Browser' / 'Application' / 'browser.exe')
-    return next((str(p) for p in candidates if p.is_file()), '')
+def chromium_executable():
+    configure_chromium_path()
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as driver:
+            candidate = Path(driver.chromium.executable_path)
+    except Exception as exc:
+        raise RuntimeError('Không thể xác định Chromium đi kèm: ' + str(exc)) from exc
+    if not candidate.is_file() and not getattr(sys, 'frozen', False):
+        # Development/testing environments may provide system Chromium instead.
+        import shutil
+        fallback = shutil.which('chromium') or shutil.which('chromium-browser')
+        if fallback:
+            candidate = Path(fallback)
+    if not candidate.is_file():
+        raise RuntimeError('Không tìm thấy Chromium tại ' + str(candidate) + '. '
+                           'Hãy giải nén lại toàn bộ bản Windows từ GitHub Artifacts.')
+    return str(candidate)
 
 
 def get_free_port() -> int:
@@ -412,8 +502,7 @@ def is_ready(port: int) -> bool:
 
 
 @dataclass
-class CocCoc:
-    executable: str
+class ChromiumEngine:
     port: int | None = None
     process: subprocess.Popen | None = None
     mode: str = ''
@@ -448,12 +537,11 @@ class CocCoc:
             return self.port
         if self.port:
             self.close()
-        if not Path(self.executable).is_file():
-            raise RuntimeError('Không tìm thấy browser.exe của Cốc Cốc. Chọn đường dẫn hợp lệ.')
+        executable = chromium_executable()
         PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         self.port = get_free_port()
         self.mode = requested
-        args = [self.executable, '--no-first-run', '--no-default-browser-check',
+        args = [executable, '--no-first-run', '--no-default-browser-check',
                 '--remote-debugging-address=127.0.0.1',
                 f'--remote-debugging-port={self.port}', f'--user-data-dir={PROFILE_DIR}',
                 '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
@@ -461,7 +549,7 @@ class CocCoc:
         if not visible:
             args.extend(['--headless=new', '--window-size=1366,1024'])
         if sys.platform != 'win32' and hasattr(os, 'geteuid') and os.geteuid() == 0:
-            args.append('--no-sandbox')  # Only for the Linux local smoke tests.
+            args.append('--no-sandbox')  # Only for local root-run Linux tests.
         args.append('about:blank')
         self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                         creationflags=(0x08000000 if sys.platform == 'win32' else 0))
@@ -470,10 +558,12 @@ class CocCoc:
             if is_ready(self.port):
                 return self.port
             if self.process.poll() is not None:
-                raise RuntimeError('Cốc Cốc không mở được. Hãy đóng cửa sổ Cốc Cốc Offline cũ và kiểm tra bản cài đặt.')
+                self.close()
+                raise RuntimeError('Chromium không mở được. Kiểm tra đủ thư mục _internal, '
+                                   'phần mềm diệt virus và dung lượng ổ đĩa.')
             time.sleep(0.3)
         self.close()
-        raise RuntimeError('Cốc Cốc không bật được chế độ điều khiển chạy nền. Có thể thử cập nhật Cốc Cốc.')
+        raise RuntimeError('Chromium đi kèm không bật được chế độ điều khiển chạy nền.')
 
 
 def capture_verified_blob(page, expected: dict, log) -> tuple[bytes, ArchiveCheck]:
@@ -505,6 +595,70 @@ def save_atomic_bytes(data: bytes, output: Path) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def offline_reader_urls(blob: bytes, chapter_url: str, expected_count: int) -> list[str]:
+    """Recover URL order from an *existing* MHTML saved by an older release.
+
+    Only accept a reader container with an image count matching the original
+    manifest, all of which must already exist in the MHTML snapshot. Refuse
+    uncertain matches rather than quietly exporting a partial chapter.
+    """
+    from html.parser import HTMLParser
+    resources, _, html_parts = _mhtml_resources(blob)
+    priorities = ('reading-detail', 'chapter-content', 'page-chapter',
+                  'viewer-content', 'reading-content', 'chapter-reading-content',
+                  'container-chapter-reader', 'chapter-images', 'reader',
+                  'readerarea', 'chapter-body', 'entry-content', 'main')
+    # Ignore images in an advertising container even if nested in the reader.
+    exclude = ('advert', 'banner', 'adsbygoogle', 'sidebar', 'logo', 'avatar')
+
+    class ReaderParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.opened = []
+            self.found = {p: [] for p in priorities}
+
+        def handle_starttag(self, tag, attrs):
+            d = dict(attrs)
+            classes = set((d.get('class') or '').lower().split())
+            id_value = (d.get('id') or '').lower()
+            names = classes | {id_value}
+            active = set()
+            if self.opened:
+                active = self.opened[-1][1].copy()
+            for name in names:
+                if name in priorities:
+                    active.add(name)
+            bad = any(any(word in name for word in exclude) for name in names)
+            if self.opened and self.opened[-1][2]:
+                bad = True
+            if tag.lower() == 'img' and active and not bad:
+                raw = (d.get('data-src') or d.get('data-original') or d.get('src') or '')
+                if raw:
+                    uri = normalize_url(urljoin(chapter_url, raw))
+                    if (uri in resources or uri.startswith('data:image/')):
+                        for selector in active:
+                            self.found[selector].append(uri)
+            if tag.lower() not in ('img', 'meta', 'link', 'br', 'hr', 'input', 'source'):
+                self.opened.append((tag.lower(), active, bad))
+
+        def handle_endtag(self, tag):
+            # Close the nearest matching element even if the webpage HTML is malformed.
+            for i in range(len(self.opened)-1, -1, -1):
+                if self.opened[i][0] == tag.lower():
+                    del self.opened[i:]
+                    break
+
+    parser = ReaderParser()
+    for html_part in html_parts:
+        parser.feed(html_part)
+    for key in priorities:
+        urls = list(dict.fromkeys(parser.found[key]))
+        if (len(urls) == expected_count and
+                verify_mhtml(blob, urls).ok):
+            return urls
+    return []
+
+
 def _mhtml_images(blob: bytes) -> dict[str, bytes]:
     """Get only encoded image resources from the validated MHTML, keyed by Content-Location."""
     msg = BytesParser(policy=policy.default).parsebytes(blob)
@@ -521,104 +675,156 @@ def _mhtml_images(blob: bytes) -> dict[str, bytes]:
     return mapping
 
 
-def pdf_from_mhtml(blob: bytes, reader_urls: list[str], target: Path, stop=None) -> int:
-    """Create a clean A4 PDF in reading order from MHTML's verified comic images.
+def _pdf_image_reader(resource: bytes):
+    """Return a ReportLab image with accurate pixels and minimal re-encoding.
 
-    Does NOT print web page chrome, ads, headers, footers or browser UI.
-    Long vertical pictures are sliced into consecutive A4 pages without skipping pixels.
+    JPEG and PNG remain in their source encodings; WebP and other formats are
+    decoded, with transparent artwork composited onto white, then encoded to
+    high-quality JPEG. No image is cropped, sliced or discarded.
+    """
+    import io
+    from PIL import Image, ImageOps
+    from reportlab.lib.utils import ImageReader
+
+    stream = io.BytesIO(resource)
+    with Image.open(stream) as opened:
+        opened.verify()  # Detect truncated and corrupt files before writing PDF.
+    stream.seek(0)
+    with Image.open(stream) as opened:
+        opened.load()
+        exif_orientation = opened.getexif().get(274, 1)
+        if opened.format in ('JPEG', 'PNG') and exif_orientation in (None, 1):
+            # Preserve original JPEG bytes and lossless PNG pixels without re-encoding.
+            return ImageReader(io.BytesIO(resource)), opened.width, opened.height
+        picture = ImageOps.exif_transpose(opened)
+        if picture.width <= 0 or picture.height <= 0:
+            raise ValueError('Ảnh truyện không có kích thước hợp lệ')
+        width, height = picture.size
+        # All other formats: avoid losing detail through default low-quality JPEG.
+        if picture.mode in ('RGBA', 'LA') or (picture.mode == 'P' and 'transparency' in picture.info):
+            rgba = picture.convert('RGBA')
+            background = Image.new('RGB', rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel('A'))
+            picture = background
+        else:
+            picture = picture.convert('RGB')
+        encoded = io.BytesIO()
+        picture.save(encoded, format='JPEG', quality=96, subsampling=0, optimize=True)
+        encoded.seek(0)
+        return ImageReader(encoded), width, height
+
+
+def _pdf_probe(resource: bytes) -> tuple[int, int]:
+    """Validate header/content without permanently caching decoded pixel buffers."""
+    import io
+    from PIL import Image
+    with Image.open(io.BytesIO(resource)) as picture:
+        size = picture.size
+        picture.verify()
+    if size[0] <= 0 or size[1] <= 0:
+        raise ValueError('Ảnh truyện không có kích thước hợp lệ')
+    return size
+
+
+def pdf_from_mhtml(blob: bytes, reader_urls: list[str], target: Path, stop=None) -> int:
+    """Export scrolling webtoon PDF, never cutting any original image.
+
+    The images are joined top-to-bottom without borders or A4 slicing. Pages
+    are long digital-only pages, assembled from whole source images. Each page
+    has a maximum height within PDF viewer limits; breaks happen ONLY between
+    source images, never inside artwork. An exceptionally long source image
+    becomes its own page with a narrower physical page width so it still fits.
     """
     import base64
-    import io
     from urllib.parse import unquote_to_bytes
-    from PIL import Image, ImageOps
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.utils import ImageReader
     from reportlab.pdfgen import canvas
     from pypdf import PdfReader
 
-    valid = verify_mhtml(blob, reader_urls)
-    if not valid.ok:
-        raise ValueError('Không xuất PDF vì ảnh trong MHTML chưa đủ: ' + valid.explanation)
+    check = verify_mhtml(blob, reader_urls)
+    if not check.ok:
+        raise ValueError('Không xuất PDF vì ảnh trong MHTML chưa đủ: ' + check.explanation)
     images = _mhtml_images(blob)
-    targets = [normalize_url(u) for u in reader_urls if u]
-    if not targets:
+    urls = list(dict.fromkeys(normalize_url(url) for url in reader_urls if url))
+    if not urls:
         raise ValueError('Không có ảnh truyện để xuất PDF.')
+
+    # PDF points, not pixels. A long page is far better for scrolling readers.
+    target_width = 800.0
+    max_height = 12000.0  # Below PDF's conventional 14400pt page limit.
+    pages_plan = []
+    group = []
+    used_height = 0.0
+    image_count = 0
+
+    for url in urls:
+        if stop is not None and stop.is_set():
+            raise InterruptedError('Đã dừng xuất PDF')
+        resource = images.get(url)
+        if resource is None and url.startswith('data:image/'):
+            prefix, comma, data = url.partition(',')
+            if comma:
+                resource = base64.b64decode(data, validate=True) if ';base64' in prefix else unquote_to_bytes(data)
+        if not resource:
+            raise ValueError('PDF thiếu ảnh từ MHTML: ' + url[:130])
+        # Plan layout first, without keeping hundreds of decoded images in RAM.
+        px_width, px_height = _pdf_probe(resource)
+        image_height = float(target_width * px_height / px_width)
+        if image_height > max_height:
+            if group:
+                pages_plan.append((target_width, used_height, group))
+                group, used_height = [], 0.0
+            exact_width = max_height * px_width / px_height
+            pages_plan.append((exact_width, max_height, [(resource, max_height)]))
+        else:
+            if group and used_height + image_height > max_height:
+                pages_plan.append((target_width, used_height, group))
+                group, used_height = [], 0.0
+            group.append((resource, image_height))
+            used_height += image_height
+        image_count += 1
+    if group:
+        pages_plan.append((target_width, used_height, group))
+    if not pages_plan or image_count != len(urls):
+        raise RuntimeError(f'PDF thiếu ảnh: {image_count}/{len(urls)}')
+
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + '.part')
-    if temporary.exists():
-        temporary.unlink()
-    page_w, page_h = A4
-    margin = 22
-    width_pts = page_w - 2 * margin
-    y_top = page_h - margin
-    curr_y = y_top
-    drawn = 0
-    page_count = 0
-    pdf = canvas.Canvas(str(temporary), pagesize=A4, pageCompression=1)
-    pdf.setTitle(target.stem)
+    temporary.unlink(missing_ok=True)
     try:
-        for raw_url in targets:
+        pdf = canvas.Canvas(str(temporary), pagesize=(target_width, 1000), pageCompression=1)
+        pdf.setTitle(target.stem)
+        for width_pts, height_pts, items in pages_plan:
             if stop is not None and stop.is_set():
                 raise InterruptedError('Đã dừng xuất PDF')
-            resource = images.get(raw_url)
-            if resource is None and raw_url.startswith('data:image/'):
-                header, sep, data = raw_url.partition(',')
-                if sep:
-                    resource = (base64.b64decode(data, validate=True)
-                                if ';base64' in header else unquote_to_bytes(data))
-            if not resource:
-                raise ValueError('PDF thiếu ảnh từ MHTML: ' + raw_url[:130])
-            with Image.open(io.BytesIO(resource)) as raw:
-                raw.load()
-                picture = ImageOps.exif_transpose(raw)
-                if picture.width < 1 or picture.height < 1:
-                    raise ValueError('Ảnh không có kích thước hợp lệ: ' + raw_url[:130])
-                if picture.mode in ('RGBA', 'LA') or (picture.mode == 'P' and 'transparency' in picture.info):
-                    background = Image.new('RGB', picture.size, '#FFFFFF')
-                    overlay = picture.convert('RGBA')
-                    background.paste(overlay, mask=overlay.getchannel('A'))
-                    picture = background
-                elif picture.mode != 'RGB':
-                    picture = picture.convert('RGB')
-                py = 0
-                while py < picture.height:
-                    if stop is not None and stop.is_set():
-                        raise InterruptedError('Đã dừng xuất PDF')
-                    remaining_pts = curr_y - margin
-                    if remaining_pts < 36:
-                        pdf.showPage()
-                        page_count += 1
-                        curr_y = y_top
-                        remaining_pts = curr_y - margin
-                    # Pixel slice height is derived from original image resolution.
-                    chunk_px = min(picture.height - py, max(1, int(remaining_pts * picture.width / width_pts)))
-                    crop = picture.crop((0, py, picture.width, py + chunk_px))
-                    jpg = io.BytesIO()
-                    crop.save(jpg, format='JPEG', quality=90, optimize=True)
-                    jpg.seek(0)
-                    drawn_h = chunk_px * width_pts / picture.width
-                    pdf.drawImage(ImageReader(jpg), margin, curr_y - drawn_h,
-                                  width=width_pts, height=drawn_h)
-                    curr_y -= drawn_h
-                    py += chunk_px
-                    if py < picture.height:
-                        pdf.showPage()
-                        page_count += 1
-                        curr_y = y_top
-                drawn += 1
-        if drawn != len(targets):
-            raise RuntimeError(f'Chỉ đưa vào PDF {drawn}/{len(targets)} ảnh')
+            pdf.setPageSize((width_pts, height_pts))
+            top = height_pts
+            for resource, draw_h in items:
+                if stop is not None and stop.is_set():
+                    raise InterruptedError('Đã dừng xuất PDF')
+                image, _, _ = _pdf_image_reader(resource)
+                top -= draw_h
+                # Zero margins. Each image joins the next like a scrolling web page.
+                pdf.drawImage(image, 0, max(0.0, top),
+                              width=width_pts, height=draw_h, mask='auto')
+            pdf.showPage()
         pdf.save()
         with temporary.open('rb') as file:
-            checkpdf = PdfReader(file, strict=False)
-            pages = len(checkpdf.pages)
-        if pages < 1 or temporary.stat().st_size < 1500:
-            raise RuntimeError('PDF tạo ra không hợp lệ.')
+            reader = PdfReader(file, strict=False)
+            count = len(reader.pages)
+            # Count draw instructions, not unique embedded images: PDF correctly
+            # de-duplicates identical image XObjects even when drawn many times.
+            drawn = 0
+            import re
+            for page in reader.pages:
+                contents = page.get_contents()
+                raw = contents.get_data() if contents is not None else b''
+                drawn += len(re.findall(rb'/[^\s/]+\s+Do\b', raw))
+        if count != len(pages_plan) or drawn < image_count or temporary.stat().st_size < 1500:
+            raise RuntimeError(f'PDF bị thiếu lệnh vẽ ảnh hoặc không hợp lệ: {drawn}/{image_count}')
         os.replace(temporary, target)
-        return pages
+        return count
     finally:
         temporary.unlink(missing_ok=True)
-
 
 def read_pdf_manifest(folder: Path) -> dict:
     try:
@@ -643,6 +849,7 @@ def pdf_completed(folder: Path, chapter: str, url: str, target: Path) -> bool:
         return False
     if not (entry.get('url') == url and entry.get('file') == target.name
             and entry.get('source_count', 0) > 0 and entry.get('pages', 0) > 0
+            and entry.get('render_version') == PDF_RENDER_VERSION
             and target.stat().st_size > 1500 and target.stat().st_size == entry.get('bytes')):
         return False
     return _sha256_file(target) == entry.get('sha256')
@@ -655,7 +862,7 @@ def write_pdf_manifest(folder: Path, chapter: str, url: str, path: Path,
     data[chapter] = {'url': url, 'file': path.name, 'bytes': path.stat().st_size,
                      'source_count': image_count, 'pages': page_count,
                      'sha256': _sha256_file(path),
-                     'version': VERSION, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')}
+                     'render_version': PDF_RENDER_VERSION, 'version': VERSION, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')}
     tmp = folder / 'TIEN_DO_PDF.json.tmp'
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     os.replace(tmp, folder / 'TIEN_DO_PDF.json')
@@ -741,8 +948,7 @@ class App:
         self.cancel = threading.Event()
         self.busy = False
         self.settings = self._load_settings()
-        self.browser = CocCoc(self.settings.get('browser') or find_coccoc())
-        self.browser_var = tk.StringVar(value=self.browser.executable)
+        self.browser = ChromiumEngine()
         self.folder_var = tk.StringVar(value=self.settings.get('folder', str(Path.home() / 'Downloads' / 'Truyen_Offline')))
         self.start_var = tk.StringVar(value=str(self.settings.get('start', '1')))
         self.end_var = tk.StringVar(value=str(self.settings.get('end', '100')))
@@ -757,8 +963,8 @@ class App:
     def _ui(self):
         main = ttk.Frame(self.root, padding=16)
         main.pack(fill='both', expand=True)
-        ttk.Label(main, text='TruyenSaver – Cốc Cốc Offline', font=('Segoe UI', 19, 'bold')).pack(anchor='w')
-        ttk.Label(main, text='Chạy nền • Chỉ dùng ảnh vùng đọc • MHTML offline và PDF sạch quảng cáo',
+        ttk.Label(main, text='TruyenSaver – Chromium Offline', font=('Segoe UI', 19, 'bold')).pack(anchor='w')
+        ttk.Label(main, text='Chạy nền • MHTML offline • PDF cuộn dọc, không cắt ảnh',
                   foreground='#34526a').pack(anchor='w', pady=(3,12))
         ttk.Label(main, text='Link trang danh sách truyện (mỗi dòng một bộ truyện, hỗ trợ hai website):').pack(anchor='w')
         self.links = tk.Text(main, height=3, font=('Segoe UI', 10), wrap='word')
@@ -787,15 +993,12 @@ class App:
                                          variable=self.merge_var)
         self.merge_box.pack(side='left')
         self._sync_format()
-        ttk.Label(main, text='Vị trí Cốc Cốc (browser.exe):').pack(anchor='w', pady=(9,2))
-        exe = ttk.Frame(main)
-        exe.pack(fill='x')
-        ttk.Entry(exe, textvariable=self.browser_var).pack(side='left', fill='x', expand=True)
-        ttk.Button(exe, text='Chọn...', command=self._choose_browser).pack(side='left', padx=5)
+        ttk.Label(main, text='Chromium đi kèm ứng dụng • chạy nền, không cần cài thêm trình duyệt.',
+                  foreground='#34526a').pack(anchor='w', pady=(9,2))
         controls = ttk.Frame(main)
         controls.pack(fill='x', pady=(14,8))
         self.buttons = []
-        for label, func in [('Mở Cốc Cốc để đăng nhập', self.login),
+        for label, func in [('Mở Chromium để đăng nhập', self.login),
                             ('Quét danh sách chap', self.scan),
                             ('BẮT ĐẦU LƯU OFFLINE', self.download)]:
             btn = ttk.Button(controls, text=label, command=func)
@@ -809,7 +1012,7 @@ class App:
         ttk.Label(main, text='Nhật ký tải truyện:', font=('Segoe UI',10,'bold')).pack(anchor='w')
         self.logs = scrolledtext.ScrolledText(main, height=14, font=('Consolas', 9), state='disabled', wrap='word')
         self.logs.pack(fill='both', expand=True, pady=(5,7))
-        ttk.Label(main, text='PDF được tạo từ ảnh truyện đã xác minh bên trong MHTML, không in cả trang web. '
+        ttk.Label(main, text='PDF liền mạch: ghép ảnh nguyên vẹn trên trang dài, không cắt ảnh theo khổ A4. '
                   'Tùy chọn gộp chỉ xuất khi đủ tất cả chap đã chọn. Hãy thử offline 1–2 chap trước.',
                   foreground='#755215', wraplength=900).pack(anchor='w')
 
@@ -817,16 +1020,18 @@ class App:
         self.merge_box.configure(state='disabled' if self.format_var.get() == 'MHTML (đọc offline)' else 'normal')
 
     def _load_settings(self):
-        try:
-            data = json.loads(SETTINGS.read_text(encoding='utf-8'))
-            return data if isinstance(data, dict) else {}
-        except (OSError, TypeError, ValueError):
-            return {}
+        for path in (SETTINGS, LEGACY_SETTINGS):
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+                if isinstance(data, dict):
+                    return data
+            except (OSError, TypeError, ValueError):
+                continue
+        return {}
 
     def _save_settings(self):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         SETTINGS.write_text(json.dumps({'folder': self.folder_var.get().strip(),
-            'browser': self.browser_var.get().strip(),
             'start': self.start_var.get().strip(),
             'end': self.end_var.get().strip(),
             'links': self.links.get('1.0','end').strip(),
@@ -837,12 +1042,6 @@ class App:
             initialdir=self.folder_var.get() if Path(self.folder_var.get()).is_dir() else str(Path.home()))
         if path:
             self.folder_var.set(path)
-            self._save_settings()
-
-    def _choose_browser(self):
-        path = filedialog.askopenfilename(title='Chọn browser.exe của Cốc Cốc',filetypes=[('Tệp EXE', '*.exe')])
-        if path:
-            self.browser_var.set(path)
             self._save_settings()
 
     def _open_folder(self):
@@ -895,10 +1094,6 @@ class App:
             raise ValueError('Số chap không hợp lệ.')
         if not (0 <= start <= end):
             raise ValueError('Khoảng chap phải tăng dần và không âm.')
-        browser = self.browser_var.get().strip()
-        if not Path(browser).is_file():
-            raise ValueError('Không tìm thấy browser.exe của Cốc Cốc. Nhấn Chọn... để chỉ vị trí.')
-        self.browser.executable = browser
         folder = Path(self.folder_var.get().strip()).expanduser().resolve()
         folder.mkdir(parents=True, exist_ok=True)
         self._save_settings()
@@ -941,9 +1136,9 @@ class App:
     def login(self):
         def action(urls,start,end,folder,mode,merge):
             self.browser.ensure(visible=True)
-            self.log('Đã mở Cốc Cốc bằng hồ sơ riêng. Hãy đăng nhập nếu website yêu cầu.')
-            self.log('Đóng cửa sổ đăng nhập trước khi bấm Quét/Bắt đầu, để tránh lỗi hồ sơ đang sử dụng.')
-            return 'Đã mở Cốc Cốc – hãy đăng nhập rồi tiếp tục'
+            self.log('Đã mở Chromium với hồ sơ riêng. Hãy đăng nhập nếu website yêu cầu.')
+            self.log('Đóng cửa sổ Chromium đăng nhập trước khi bấm Quét/Bắt đầu; hồ sơ vẫn được lưu.')
+            return 'Đã mở Chromium – hãy đăng nhập rồi tiếp tục'
         self._run(action)
 
     def scan(self):
@@ -1030,6 +1225,26 @@ class App:
                                    f'{title}: Chap {number} ({idx}/{len(chapters)})')
                         needs_mhtml = want_mhtml and not completed(dest, number, chap['url'], archive)
                         needs_pdf = want_pdf and not pdf_completed(dest, number, chap['url'], pdf_file)
+                        # Rebuild A4 PDFs as seamless PDFs from verified saved MHTML,
+                        # without re-downloading any artwork, where possible.
+                        if needs_pdf and archive.is_file() and completed(dest, number, chap['url'], archive):
+                            try:
+                                old_blob = archive.read_bytes()
+                                entry = read_manifest(dest).get(number) or {}
+                                image_urls = entry.get('reader_urls') or offline_reader_urls(
+                                    old_blob, chap['url'], int(entry.get('expected') or 0))
+                                if not image_urls or not verify_mhtml(old_blob, image_urls).ok:
+                                    raise ValueError('Không khôi phục được danh sách ảnh từ MHTML cũ')
+                                pages = pdf_from_mhtml(old_blob, image_urls, pdf_file, self.cancel)
+                                write_pdf_manifest(dest, number, chap['url'], pdf_file,
+                                                   len(image_urls), pages)
+                                needs_pdf = False
+                                self.log(f'Chap {number}: đã tạo PDF liền mạch trực tiếp từ MHTML cũ ({pages} trang).')
+                            except InterruptedError:
+                                raise
+                            except Exception as exc:
+                                self.log(f'Chap {number}: không dùng lại được MHTML, sẽ tải lại: {exc}')
+
                         if not needs_mhtml and not needs_pdf:
                             self.log(f'Chap {number}: đã có đủ định dạng, bỏ qua.')
                             done += 1
@@ -1049,13 +1264,13 @@ class App:
                                     if needs_mhtml:
                                         save_atomic_bytes(blob, archive)
                                         write_manifest_entry(dest, number, chap['url'], archive,
-                                                             check.expected, check.matched)
+                                                             check.expected, check.matched, reader['urls'])
                                         self.log(f'    Lưu offline: {archive.name} ({check.matched} ảnh).')
                                     if needs_pdf:
                                         pages = pdf_from_mhtml(blob, reader['urls'], pdf_file, self.cancel)
                                         write_pdf_manifest(dest, number, chap['url'], pdf_file,
                                                            len(reader['urls']), pages)
-                                        self.log(f'    PDF: {pdf_file.name}, {pages} trang.')
+                                        self.log(f'    PDF liền mạch: {pdf_file.name}, {pages} trang dài (không cắt ảnh).')
                                     break
                                 except InterruptedError:
                                     raise
