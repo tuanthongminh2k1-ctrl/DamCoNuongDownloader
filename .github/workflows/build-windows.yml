@@ -1,5 +1,5 @@
 
-name: Tao EXE TruyenSaver CocCoc v2.1 PDF
+name: Tao EXE TruyenSaver Chromium v2.4
 
 on:
   workflow_dispatch:
@@ -12,24 +12,33 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Get source
         uses: actions/checkout@v4
 
-      - name: Set up Python on GitHub
+      - name: Install Python on GitHub only
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install libraries
+      - name: Install build dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install "playwright>=1.54,<2" "pillow>=11,<13" "reportlab>=4.2,<5" "pypdf>=5,<7" "pyinstaller>=6.10,<7"
 
-      - name: Test source
+      - name: Download full Chromium into portable bundle
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $env:GITHUB_WORKSPACE 'playwright-browsers'
+          python -m playwright install chromium
+          if (-not (Test-Path $env:PLAYWRIGHT_BROWSERS_PATH)) {
+            throw 'Chromium was not downloaded'
+          }
+
+      - name: Test sources
         shell: pwsh
         run: |
           python -m py_compile app.py
@@ -37,22 +46,27 @@ jobs:
             python -m unittest discover -s tests -p "test_*.py" -v
           }
 
-      - name: Build EXE
+      - name: Build GUI and bundle Chromium
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name TruyenSaver_CocCoc_v2_1 --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf app.py
+          $browsers = Join-Path $env:GITHUB_WORKSPACE 'playwright-browsers'
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name TruyenSaver_Chromium_v2_4 --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf --add-data "$browsers;playwright-browsers" app.py
 
-      - name: Verify EXE
+      - name: Verify portable browser and EXE
         shell: pwsh
         run: |
-          if (-not (Test-Path 'dist/TruyenSaver_CocCoc_v2_1.exe')) {
-            throw 'EXE was not created'
+          $app = 'dist/TruyenSaver_Chromium_v2_4'
+          if (-not (Test-Path "$app/TruyenSaver_Chromium_v2_4.exe")) {
+            throw 'EXE missing'
+          }
+          if (-not (Test-Path "$app/_internal/playwright-browsers")) {
+            throw 'Bundled Chromium missing'
           }
 
-      - name: Upload EXE
+      - name: Upload portable Windows folder
         uses: actions/upload-artifact@v4
         with:
-          name: TruyenSaver-CocCoc-v2.1-Windows
-          path: dist/TruyenSaver_CocCoc_v2_1.exe
+          name: TruyenSaver-Chromium-v2.4-Portable
+          path: dist/TruyenSaver_Chromium_v2_4/
           retention-days: 14
           if-no-files-found: error
