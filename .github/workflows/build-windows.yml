@@ -1,53 +1,58 @@
 
-name: Tao EXE TruyenSaver CocCoc Offline v1.1
+name: Tao EXE TruyenSaver CocCoc v2.1 PDF
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
+    timeout-minutes: 30
+
     steps:
-      - name: Lay ma nguon
+      - name: Get source
         uses: actions/checkout@v4
 
-      - name: Cai Python tren may chu GitHub
+      - name: Set up Python on GitHub
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Cai thu vien
+      - name: Install libraries
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "playwright>=1.54,<2" "pywinauto>=0.6.9,<1" "pywin32>=306" "psutil>=6,<8" "pyinstaller>=6.10,<7"
+          python -m pip install "playwright>=1.54,<2" "pillow>=11,<13" "reportlab>=4.2,<5" "pypdf>=5,<7" "pyinstaller>=6.10,<7"
 
-      - name: Kiem tra code
+      - name: Test source
         shell: pwsh
         run: |
           python -m py_compile app.py
           if (Test-Path tests) {
-            python -m unittest discover -s tests -v
+            python -m unittest discover -s tests -p "test_*.py" -v
           }
 
-      - name: Tao file EXE
+      - name: Build EXE
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name TruyenSaver_CocCoc --collect-all playwright --collect-submodules playwright --collect-all pywinauto --hidden-import=pythoncom --hidden-import=win32gui --hidden-import=win32con --hidden-import=win32process app.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name TruyenSaver_CocCoc_v2_1 --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf app.py
 
-      - name: Kiem tra EXE
+      - name: Verify EXE
         shell: pwsh
         run: |
-          if (-not (Test-Path 'dist/TruyenSaver_CocCoc.exe')) {
-            throw 'EXE missing'
+          if (-not (Test-Path 'dist/TruyenSaver_CocCoc_v2_1.exe')) {
+            throw 'EXE was not created'
           }
 
-      - name: Dang file EXE
+      - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: TruyenSaver-CocCoc-Offline-Windows
-          path: dist/TruyenSaver_CocCoc.exe
+          name: TruyenSaver-CocCoc-v2.1-Windows
+          path: dist/TruyenSaver_CocCoc_v2_1.exe
           retention-days: 14
           if-no-files-found: error
