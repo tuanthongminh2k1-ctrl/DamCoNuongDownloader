@@ -1,4 +1,4 @@
-"""TruyenSaver Chromium Offline v3.0 – portable Windows application.
+"""TruyenSaver Chromium Offline v3.1 – portable Windows application.
 
 This app uses CDP to save MHTML, NOT Ctrl+S HTML+_files.
 No Python is required on the Windows machine *after* GitHub builds the EXE.
@@ -22,7 +22,7 @@ from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
-VERSION = '3.0.0'
+VERSION = '3.1.0'
 PDF_RENDER_VERSION = 'single-continuous-page-v3'
 SUPPORTED_HOSTS = ('damconuong.cool', 'sayhentai.cx', 'hentaicube.xyz')
 CHAPTER_RE = re.compile(r'(?:chap(?:ter)?|chương|chuong)\s*[:#\-_. ]*\s*(\d+(?:[.,]\d+)?)', re.I)
@@ -270,7 +270,7 @@ READER_JS = r'''() => {
  const top=last?last.getBoundingClientRect().top:0;
  const scrollRoot=document.scrollingElement||document.documentElement;
  const canScrollFurther=(scrollRoot.scrollTop+innerHeight < scrollRoot.scrollHeight-15);
- const readerEnd=Boolean(last&&(lastBottom<=innerHeight+100 || (!canScrollFurther&&top<innerHeight)));
+ const readerEnd=Boolean(last && top <= innerHeight+100 && lastBottom >= -100);
  return {selector:selected.sel,total:images.length,ready:images.filter(i=>i.ready).length,
  missing:images.filter(i=>!i.ready).length,valid:images.filter(i=>i.ready).length,
  images,readerEnd,scrollY,viewport:innerHeight,readerTail:Math.round(lastBottom),
@@ -307,134 +307,141 @@ def ready_to_archive(info: dict, seen_reader_tail: bool, stable_seconds: float) 
                 and seen_reader_tail and stable_seconds >= 3.0)
 
 
-def _scroll_to_last_reader_image(page) -> None:
-    page.evaluate('''() => {
-      let imgs=[...document.querySelectorAll('img[data-truyensaver-id]')];
-      if(imgs.length) imgs[imgs.length-1].scrollIntoView({block:'end',behavior:'instant'});
-    }''')
+def _scroll_to_last_reader_image(page) -> bool:
+    """Visit the last *reader image*, not the bottom of the whole document.
+
+    Return True only when we found a real last image in the selected reader.
+    The img may be taller than the viewport or live in a nested scroll root.
+    """
+    return bool(page.evaluate("""() => {
+      const nodes=[...document.querySelectorAll('img[data-truyensaver-id]')];
+      const last=nodes[nodes.length-1];
+      if (!last || !last.isConnected) return false;
+      last.scrollIntoView({block:'end',inline:'nearest',behavior:'instant'});
+      return true;
+    }"""))
 
 
 def wait_for_reader(page, log, stop, max_seconds=155) -> dict:
-    '''Two-stage check: traverse every reader image, then settle the IMAGE list.
+    """Load and verify the reader's images without requiring page-bottom.
 
-    A footer/advertisement/infinite-scroll region must not hold the reader
-    hostage. This only checks images actually exposed by the website and is not
-    proof that the server did not hide more pages.
-    '''
+    In particular, 35/35 loaded must not be rejected merely because an
+    infinitely extending ad/footer prevents `readerEnd` from being true.
+    We *do* require a stable list and explicit visit to the last reader image,
+    then verify the actual image resources in the captured MHTML separately.
+    """
     deadline = time.monotonic() + max_seconds
-    last: dict = {}
-    diagnostic = 'unknown'
-    # Retry only when there are broken/lazy images; don't wait ~190 seconds if
-    # every observed reader image is loaded and the reader itself has been seen.
-    for attempt in range(3):
-        if stop.is_set():
-            raise InterruptedError('Đã yêu cầu dừng')
+    info = {}
+    try:
         page.evaluate('window.scrollTo(0,0)')
         page.evaluate(EAGER_JS)
-        discovered = False
-        reader_tail_seen = False
-        last_signature = None
-        stable_since = None
-        last_reader_y = None
-        no_move = 0
-        steps = 0
-        # A second pass after the initial sweep covers lazy-loaded images that
-        # appear at the tail when entering the reader for the first time.
-        while time.monotonic() < deadline and steps < 850:
-            if stop.is_set():
-                raise InterruptedError('Đã yêu cầu dừng')
+    except Exception:
+        if stop.is_set():
+            raise InterruptedError('Đã dừng')
+        raise
+    last_signature = None
+    stable_since = time.monotonic()
+    last_y = None
+    stuck_steps = 0
+    visited_last = False
+    last_probe_at = 0.0
+    count = 0
+    while time.monotonic() < deadline and count < 1300:
+        if stop.is_set():
+            raise InterruptedError('Đã dừng')
+        try:
             info = page.evaluate(READER_JS)
-            last = info
-            if not info['selector']:
-                if steps > 25:
-                    break
-                page.wait_for_timeout(350)
-                steps += 1
-                continue
-            discovered = True
-            if info['readerEnd']:
-                reader_tail_seen = True
-            sig = reader_signature(info)
-            if sig != last_signature:
-                stable_since = time.monotonic()
-            last_signature = sig
-            stable_seconds = time.monotonic() - stable_since if stable_since else 0
-            # A full top-to-reader-tail sweep was already performed. Do a brief
-            # independent recheck of the final reader image instead of making a
-            # second full sweep (which can be slow on long webtoons).
-            if ready_to_archive(info, reader_tail_seen, stable_seconds):
-                page.evaluate(EAGER_JS)
-                _scroll_to_last_reader_image(page)
-                page.wait_for_timeout(300)
-                confirm = page.evaluate(READER_JS)
-                if (confirm['readerEnd'] and confirm['missing'] == 0
-                        and reader_signature(confirm) == sig):
-                    urls = list(dict.fromkeys(normalize_url(x['src']) for x in confirm['images']))
-                    if not urls:
-                        raise RuntimeError('Không tìm thấy URL ảnh truyện hợp lệ.')
-                    log(f"    Ảnh truyện đã đủ, ổn định: {confirm['ready']}/{confirm['total']}; "
-                        f"đã kiểm tra lại đuôi vùng đọc (lượt {attempt+1}).")
-                    return {'urls': urls, 'total': len(urls), 'selector': confirm['selector']}
-                stable_since = None
-            # Read the last image, not the ever-growing footer. At the reader's
-            # last image, wait for counts and URLs to settle without scrolling.
-            if info['readerEnd']:
-                page.wait_for_timeout(220)
-            else:
-                current_y = info['scrollY']
-                if current_y == last_reader_y:
-                    no_move += 1
-                else:
-                    no_move = 0
-                last_reader_y = current_y
-                if no_move >= 3:
-                    # Handles scroll containers and pages with huge footers.
-                    _scroll_to_last_reader_image(page)
-                    page.wait_for_timeout(300)
-                    no_move = 0
-                else:
-                    page.evaluate('window.scrollBy(0,Math.max(420,Math.floor(innerHeight*0.94)))')
-                    page.wait_for_timeout((85, 150, 240)[attempt])
-            steps += 1
-            # If the reader itself is loaded but a few images are broken, don't
-            # use the whole remaining budget to stare at the same missing image.
-            if info['readerEnd'] and info['missing'] > 0 and stable_seconds >= 7:
-                break
-        if not discovered:
-            raise RuntimeError('Không tìm thấy vùng đọc truyện. Trang có thể cần đăng nhập hoặc cấu trúc website đã đổi.')
-        diagnostic = (f"{last.get('ready',0)}/{last.get('total',0)} ảnh; "
-                      f"đã đến cuối vùng đọc: {'có' if reader_tail_seen else 'chưa'}")
-        if time.monotonic() >= deadline:
-            break
-        missing = [i for i in last.get('images', []) if not i['ready']]
-        log(f"    Lượt {attempt+1}: {diagnostic}; "
-            f"{len(missing)} ảnh chưa xong. Đang quét lại vùng đọc...")
-        # Retry specific lazy/broken images, with per-image viewport activation.
-        for image in missing[:150]:
+        except Exception:
             if stop.is_set():
-                raise InterruptedError('Đã yêu cầu dừng')
-            if time.monotonic() >= deadline:
-                break
+                raise InterruptedError('Đã dừng')
+            raise
+        count += 1
+        if not info.get('selector') or not info.get('total'):
+            if count > 30:
+                raise RuntimeError('Không tìm thấy ảnh truyện. Website có thể yêu cầu đăng nhập.')
+            page.wait_for_timeout(200)
+            continue
+        sig = reader_signature(info)
+        now = time.monotonic()
+        if sig != last_signature:
+            stable_since = now
+            last_signature = sig
+        stable = now - stable_since
+        loaded = info.get('missing', 1) == 0 and info.get('ready', 0) == info.get('total', 0)
+        # When all observed images are ready, explicitly visit the last image.
+        # This works even if the last image is longer than a screen and a sticky
+        # footer or a nested scroller makes a viewport-only tail flag unreliable.
+        if loaded and now-last_probe_at >= 0.8:
+            if stop.is_set():
+                raise InterruptedError('Đã dừng')
             try:
-                page.evaluate('''key => {
-                 const el=[...document.querySelectorAll('img')].find(i=>i.dataset.truyensaverId===key);
-                 if(el) { el.scrollIntoView({block:'center'}); el.loading='eager'; }
-                }''', image['key'])
-                page.wait_for_timeout(270 + attempt * 230)
+                visited_last |= _scroll_to_last_reader_image(page)
             except Exception:
-                pass
-        page.evaluate(EAGER_JS)
-        _scroll_to_last_reader_image(page)
-        page.wait_for_timeout(500)
-    # Clear diagnostic makes 35/35-but-unstable distinct from missing 3/35.
-    raise RuntimeError(f'Không thể xác nhận đủ ảnh truyện ({diagnostic}). '
-                       'Không lưu chap chưa xác minh; kiểm tra trang có cần đăng nhập, '
-                       'có ảnh hỏng hoặc ảnh bị ẩn hay không.')
+                if stop.is_set():
+                    raise InterruptedError('Đã dừng')
+                raise
+            last_probe_at = now
+        tail_seen = bool(info.get('readerEnd')) or visited_last
+        if ready_to_archive(info, tail_seen, stable):
+            if stop.is_set():
+                raise InterruptedError('Đã dừng')
+            # Make the independent confirmation after a short settle delay.
+            page.wait_for_timeout(350)
+            if stop.is_set():
+                raise InterruptedError('Đã dừng')
+            confirm = page.evaluate(READER_JS)
+            if (confirm.get('missing') == 0 and
+                    confirm.get('ready') == confirm.get('total') and
+                    reader_signature(confirm) == sig):
+                urls = list(dict.fromkeys(normalize_url(x['src']) for x in confirm['images']))
+                if urls:
+                    log(f"    Ảnh truyện đã tải ổn định: {confirm['ready']}/{confirm['total']}; "
+                        f"đã kiểm tra ảnh cuối vùng đọc (không phụ thuộc chân trang web).")
+                    return {'urls': urls, 'total': len(urls), 'selector': confirm['selector']}
+            # If the list changed while confirming, restart stabilization.
+            last_signature = None
+            stable_since = time.monotonic()
+            continue
+        if stop.is_set():
+            raise InterruptedError('Đã dừng')
+        if loaded and visited_last:
+            page.wait_for_timeout(190)
+            continue
+        # For lazy images, sweep down the page until the reader tail is seen.
+        # Once apparently stuck, activate missing images individually instead
+        # of scrolling forever through unrelated comments and advertisements.
+        y=info.get('scrollY')
+        if y == last_y:
+            stuck_steps += 1
+        else:
+            stuck_steps = 0
+        last_y = y
+        if stuck_steps >= 3:
+            incomplete = next((i for i in info.get('images',[]) if not i['ready']), None)
+            if incomplete:
+                page.evaluate("""key => {
+                   const el=[...document.querySelectorAll('img')].find(i=>i.dataset.truyensaverId===key);
+                   if(el) {el.loading='eager';el.scrollIntoView({block:'center',behavior:'instant'});}
+                }""",incomplete['key'])
+            else:
+                visited_last |= _scroll_to_last_reader_image(page)
+            page.evaluate(EAGER_JS)
+            stuck_steps = 0
+            page.wait_for_timeout(250)
+        else:
+            page.evaluate('window.scrollBy(0,Math.max(540,Math.floor(innerHeight*0.96)))')
+            page.wait_for_timeout(120)
+    if stop.is_set():
+        raise InterruptedError('Đã dừng')
+    explanation = (f"{info.get('ready',0)}/{info.get('total',0)} ảnh; "
+                   f"ảnh cuối đã kiểm tra: {'có' if visited_last else 'chưa'}")
+    raise RuntimeError('Không thể xác nhận đủ ảnh truyện sau khi chờ: '+explanation+
+                       '. Không tự lưu thiếu; kiểm tra đăng nhập hoặc ảnh lỗi.')
 
 
 # ---- Windows UI and browser controller ----
 
-"""TruyenSaver Chromium Offline 3.0 (Windows).
+"""TruyenSaver Chromium Offline 3.1 (Windows).
 
 Runs a bundled Chromium using a private persistent profile through CDP.
 No desktop keyboard or mouse simulation, no Chromium installation required.
@@ -538,6 +545,29 @@ class ChromiumEngine:
         self.port = None
         self.process = None
         self.mode = ''
+
+    def abort(self):
+        """Emergency stop: end every active network request in our Chromium.
+
+        This does not send keystrokes, does not affect other browser windows,
+        and is called from a worker so the GUI remains responsive.
+        """
+        proc=self.process
+        self.port=None
+        self.process=None
+        self.mode=''
+        if not proc or proc.poll() is not None:
+            return
+        if sys.platform == 'win32':
+            try:
+                subprocess.run(['taskkill','/F','/T','/PID',str(proc.pid)],
+                               stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                               creationflags=0x08000000,timeout=8,check=False)
+            except Exception:
+                pass
+        if proc.poll() is None:
+            try: proc.kill()
+            except OSError: pass
 
     def ensure(self, *, visible=False) -> int:
         requested = 'visible' if visible else 'headless'
@@ -670,11 +700,15 @@ def capture_verified_blob(page, expected: dict, log, strip_ads: bool = True) -> 
     return data, check
 
 
-def save_atomic_bytes(data: bytes, output: Path) -> None:
+def save_atomic_bytes(data: bytes, output: Path, stop=None) -> None:
+    if stop is not None and stop.is_set():
+        raise InterruptedError('Đã dừng trước khi ghi MHTML')
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_name(output.name + '.part')
     try:
         tmp.write_bytes(data)
+        if stop is not None and stop.is_set():
+            raise InterruptedError('Đã dừng trước khi lưu MHTML')
         os.replace(tmp, output)
     finally:
         tmp.unlink(missing_ok=True)
@@ -854,6 +888,8 @@ def pdf_from_mhtml(blob: bytes, reader_urls: list[str], target: Path, stop=None)
     from reportlab.pdfgen import canvas
     from pypdf import PdfReader
 
+    if stop is not None and stop.is_set():
+        raise InterruptedError('Đã dừng trước khi xử lý PDF')
     check = verify_mhtml(blob, reader_urls)
     if not check.ok:
         raise ValueError('Không xuất PDF vì ảnh MHTML chưa đủ: ' + check.explanation)
@@ -909,6 +945,8 @@ def pdf_from_mhtml(blob: bytes, reader_urls: list[str], target: Path, stop=None)
                       for p in reader.pages)
         if drawn<len(urls) or tmp.stat().st_size<1500:
             raise RuntimeError(f'PDF thiếu ảnh: {drawn}/{len(urls)}')
+        if stop is not None and stop.is_set():
+            raise InterruptedError('Đã dừng trước khi hoàn tất PDF')
         os.replace(tmp,target)
         return len(plan)
     finally:
@@ -994,6 +1032,8 @@ def merge_chapter_pdfs(folder: Path, chapters: list[dict], output: Path, stop=No
             with temp.open('rb') as stream:
                 if len(PdfReader(stream, strict=False).pages) != total:
                     raise RuntimeError('Số trang PDF gộp không khớp')
+            if stop is not None and stop.is_set():
+                raise InterruptedError('Đã dừng trước khi hoàn tất PDF gộp')
             os.replace(temp, output)
         finally:
             temp.unlink(missing_ok=True)
@@ -1065,6 +1105,8 @@ class App:
         self.root.minsize(850, 720)
         self.eventq = queue.Queue()
         self.cancel = threading.Event()
+        self._futures_lock = threading.RLock()
+        self._futures = set()
         self.busy = False
         self.settings = self._load_settings()
         self.browser = ChromiumEngine()
@@ -1277,15 +1319,28 @@ class App:
                 self.log('Đã dừng theo yêu cầu. Các chap đã lưu vẫn được giữ lại.')
                 msg='Đã dừng'
             except Exception as exc:
-                self.log('LỖI: '+str(exc))
-                msg='Có lỗi – xem nhật ký'
+                if self.cancel.is_set():
+                    self.log('Đã hủy tác vụ và ngắt kết nối Chromium.')
+                    msg='Đã dừng'
+                else:
+                    self.log('LỖI: '+str(exc))
+                    msg='Có lỗi – xem nhật ký'
             finally:
                 self._emit('finish', msg)
         threading.Thread(target=worker, daemon=True).start()
 
     def stop(self):
+        if not self.busy or self.cancel.is_set():
+            return
         self.cancel.set()
-        self.log('Đang yêu cầu dừng ở bước an toàn...')
+        self.stop_button.configure(state='disabled')
+        self.status_var.set('Đang dừng mọi tác vụ…')
+        self.log('DỪNG: hủy toàn bộ chap chờ, ngắt Chromium và ngừng tải/PDF.')
+        with self._futures_lock:
+            for future in tuple(self._futures):
+                future.cancel()
+        # Killing the browser interrupts in-flight page.goto / CDP calls.
+        threading.Thread(target=self.browser.abort, name='stop-chromium',daemon=True).start()
 
     def login(self):
         def action(urls,start,end,folder,mode,workers,strip_ads):
@@ -1351,6 +1406,8 @@ class App:
                          strip_ads: bool, source_dir: Path | None = None) -> tuple[bool, str]:
         """Independent CDP connection per worker; no global mouse/keyboard use."""
         from playwright.sync_api import sync_playwright
+        if self.cancel.is_set():
+            raise InterruptedError('Đã dừng trước khi bắt đầu chap')
         number=chapter_label(chap['number'])
         url=chap['url']
         source_dir=source_dir or dest
@@ -1369,6 +1426,8 @@ class App:
                 img_urls=entry.get('reader_urls') or offline_reader_urls(blob,url,int(entry.get('expected') or 0))
                 if img_urls and verify_mhtml(blob,img_urls).ok:
                     pages=pdf_from_mhtml(blob,img_urls,target,self.cancel)
+                    if self.cancel.is_set():
+                        raise InterruptedError('Đã dừng trước khi xác nhận PDF')
                     write_pdf_manifest(dest,number,url,target,len(img_urls),pages)
                     return True, f'Chap {number}: tái sử dụng MHTML cũ, PDF {pages} trang.'
             except InterruptedError:
@@ -1377,6 +1436,8 @@ class App:
                 self.log(f'Chap {number}: MHTML cũ chưa đủ, tải lại ({exc}).')
         with sync_playwright() as driver:
             browser=driver.chromium.connect_over_cdp(f'http://127.0.0.1:{port}',timeout=20000)
+            if self.cancel.is_set():
+                raise InterruptedError('Đã dừng trước khi mở trang')
             page=browser.contexts[0].new_page()
             try:
                 for attempt in range(3):
@@ -1392,14 +1453,20 @@ class App:
                         page.wait_for_timeout(350)
                         reader=wait_for_reader(page,self.log,self.cancel,max_seconds=(65,90,110)[attempt])
                         blob,check=capture_verified_blob(page,reader,self.log,strip_ads=strip_ads)
+                        if self.cancel.is_set():
+                            raise InterruptedError('Đã dừng trước khi lưu chap')
                         if mode=='mhtml':
-                            save_atomic_bytes(blob,archive)
+                            save_atomic_bytes(blob,archive,self.cancel)
+                            if self.cancel.is_set():
+                                raise InterruptedError('Đã dừng trước khi xác nhận chap')
                             write_manifest_entry(source_dir,number,url,archive,check.expected,check.matched,
                                                  reader['urls'],ads_filtered=strip_ads)
                             if not completed(source_dir,number,url,archive,require_ad_free=strip_ads):
                                 raise RuntimeError('Chưa xác nhận được MHTML đã lưu')
                             return True,f'Chap {number}: lưu MHTML đủ {check.matched} ảnh.'
                         pages=pdf_from_mhtml(blob,reader['urls'],target,self.cancel)
+                        if self.cancel.is_set():
+                            raise InterruptedError('Đã dừng trước khi xác nhận PDF')
                         write_pdf_manifest(dest,number,url,target,len(reader['urls']),pages)
                         if not pdf_completed(dest,number,url,target):
                             raise RuntimeError('Chưa xác nhận được PDF đã lưu')
@@ -1407,6 +1474,8 @@ class App:
                     except InterruptedError:
                         raise
                     except Exception as exc:
+                        if self.cancel.is_set():
+                            raise InterruptedError('Đã dừng toàn bộ tác vụ') from exc
                         self.log(f'Chap {number}: lỗi lượt {attempt+1}: {exc}')
                         if attempt==2:
                             raise
@@ -1464,34 +1533,58 @@ class App:
             total=sum(len(spec['chapters']) for spec in specifications)
             finished=0
             self.log(f'Bắt đầu {total} chap từ {len(specifications)} nguồn; {workers} tác vụ song song.')
-            with ThreadPoolExecutor(max_workers=workers,thread_name_prefix='truyensaver') as pool:
-                jobs={}
-                # Round-robin ordering is important: the first two jobs can
-                # belong to two different websites when two series are queued.
-                for row in zip_longest(*(spec['chapters'] for spec in specifications)):
-                    for spec,chap in zip(specifications,row):
-                        if chap is None:
-                            continue
-                        future=pool.submit(self._process_chapter,port,spec['cache'],chap,mode,strip_ads,spec['dest'])
-                        jobs[future]=(spec,chap)
-                for future in as_completed(jobs):
-                    spec,chap=jobs[future]
-                    number=chapter_label(chap['number'])
-                    try:
-                        ok,message=future.result()
-                        if ok:
-                            spec['done']+=1
-                        self.log(spec['title']+': '+message)
-                    except InterruptedError:
-                        self.cancel.set()
-                    except Exception as exc:
-                        item=f'Chap {number}: {exc}'
-                        spec['failed'].append(item)
-                        self.log(spec['title']+': CHƯA HOÀN TẤT '+item)
-                    finished+=1
-                    self._emit('progress',finished,total,
-                               f'Đã xử lý {finished}/{total} chap — thành công '
-                               f'{sum(x["done"] for x in specifications)}')
+            # Submit at most `workers` jobs, not all 100 chapters at once.
+            # DỪNG cancels queued work and aborts in-flight browser operations.
+            from collections import deque
+            from concurrent.futures import wait, FIRST_COMPLETED, CancelledError
+            items=deque((spec,chap) for row in zip_longest(*(s['chapters'] for s in specifications))
+                        for spec,chap in zip(specifications,row) if chap is not None)
+            pool=ThreadPoolExecutor(max_workers=workers,thread_name_prefix='truyensaver')
+            in_flight={}
+            try:
+                while items or in_flight:
+                    if self.cancel.is_set():
+                        raise InterruptedError('Đã dừng tất cả chap')
+                    while items and len(in_flight) < workers and not self.cancel.is_set():
+                        spec,chap=items.popleft()
+                        future=pool.submit(self._process_chapter,port,spec['cache'],chap,
+                                           mode,strip_ads,spec['dest'])
+                        in_flight[future]=(spec,chap)
+                        with self._futures_lock:
+                            self._futures.add(future)
+                    if not in_flight:
+                        break
+                    done,_=wait(tuple(in_flight),timeout=.2,return_when=FIRST_COMPLETED)
+                    for future in done:
+                        spec,chap=in_flight.pop(future)
+                        with self._futures_lock:
+                            self._futures.discard(future)
+                        if self.cancel.is_set():
+                            raise InterruptedError('Đã dừng mọi tác vụ')
+                        number=chapter_label(chap['number'])
+                        try:
+                            ok,message=future.result()
+                            if ok: spec['done']+=1
+                            self.log(spec['title']+': '+message)
+                        except (InterruptedError,CancelledError):
+                            self.cancel.set()
+                            raise InterruptedError('Đã dừng mọi tác vụ')
+                        except Exception as exc:
+                            item=f'Chap {number}: {exc}'
+                            spec['failed'].append(item)
+                            self.log(spec['title']+': CHƯA HOÀN TẤT '+item)
+                        finished+=1
+                        self._emit('progress',finished,total,
+                                   f'Đã xử lý {finished}/{total} chap — thành công '
+                                   f'{sum(x["done"] for x in specifications)}')
+            finally:
+                for future in in_flight:
+                    future.cancel()
+                with self._futures_lock:
+                    self._futures.clear()
+                # Do not mark the GUI finished while Python workers still run.
+                # Their remote requests are interrupted by browser.abort().
+                pool.shutdown(wait=True,cancel_futures=True)
             if self.cancel.is_set():
                 raise InterruptedError('Đã dừng. Bộ nhớ đệm được giữ để tiếp tục sau.')
             for spec in specifications:
@@ -1530,8 +1623,9 @@ class App:
 
     def _close(self):
         if self.busy:
-            self.cancel.set()
-            messagebox.showinfo('Đang lưu', 'Đã yêu cầu dừng. Đóng cửa sổ sau khi hoàn tất bước hiện tại.')
+            self.stop()
+            messagebox.showinfo('Đang dừng', 'Đã hủy hàng chờ và yêu cầu ngắt Chromium. '
+                                'Hãy đóng ứng dụng khi trạng thái chuyển sang Đã dừng.')
             return
         self._save_settings()
         try:
