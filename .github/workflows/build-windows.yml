@@ -1,5 +1,5 @@
 
-name: Tao EXE Windows
+name: Tao EXE TruyenPDF CocCoc v4
 
 on:
   workflow_dispatch:
@@ -10,25 +10,26 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Lay ma nguon
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Cai Python
+      - name: Set up Python on GitHub runner
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Cai thu vien
+      - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 img2pdf pyinstaller
+          python -m pip install playwright pypdf pyinstaller
 
-      - name: Tao EXE
+      - name: Build standalone GUI EXE
         run: |
-          pyinstaller --onefile --windowed --name DamCoNuongDownloader DamCoNuongDownloader.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name TruyenPDF_CocCoc --collect-all playwright app.py
 
-      - name: Luu EXE
+      - name: Upload Windows app
         uses: actions/upload-artifact@v4
         with:
-          name: DamCoNuongDownloader-Windows
-          path: dist/DamCoNuongDownloader.exe
+          name: TruyenPDF-CocCoc-Windows
+          path: dist/TruyenPDF_CocCoc.exe
+          retention-days: 7
