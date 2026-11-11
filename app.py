@@ -1,4 +1,4 @@
-"""TruyenSaver Chromium Offline v2.4 – portable Windows application.
+"""TruyenSaver Chromium Offline v3.0 – portable Windows application.
 
 This app uses CDP to save MHTML, NOT Ctrl+S HTML+_files.
 No Python is required on the Windows machine *after* GitHub builds the EXE.
@@ -22,9 +22,9 @@ from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
-VERSION = '2.4.0'
-PDF_RENDER_VERSION = 'long-pages-no-splits-v1'
-SUPPORTED_HOSTS = ('damconuong.cool', 'sayhentai.cx')
+VERSION = '3.0.0'
+PDF_RENDER_VERSION = 'single-continuous-page-v3'
+SUPPORTED_HOSTS = ('damconuong.cool', 'sayhentai.cx', 'hentaicube.xyz')
 CHAPTER_RE = re.compile(r'(?:chap(?:ter)?|chương|chuong)\s*[:#\-_. ]*\s*(\d+(?:[.,]\d+)?)', re.I)
 
 
@@ -55,7 +55,7 @@ def validate_source(url: str) -> str:
     p = urlsplit(url)
     host = (p.hostname or '').lower().removeprefix('www.')
     if p.scheme != 'https' or host not in SUPPORTED_HOSTS or p.username or p.password:
-        raise ValueError('Chỉ hỗ trợ link HTTPS từ damconuong.cool hoặc sayhentai.cx.')
+        raise ValueError('Chỉ nhận HTTPS: damconuong.cool, sayhentai.cx, hentaicube.xyz.')
     return url
 
 
@@ -67,13 +67,17 @@ def chapter_from_anchor(text: str, link: str, series_url: str) -> float | None:
     series_path = ref.path.rstrip('/').lower()
     candidate_path = dest.path.rstrip('/').lower()
     stem = series_path.rsplit('/', 1)[-1].removesuffix('.html')
-    if host == 'sayhentai.cx':
-        base = series_path.removesuffix('.html')
-        suffix = candidate_path[len(base):] if candidate_path.startswith(base) else ''
-        valid = suffix.startswith(('/chapter-', '/chap-', '/chuong-',
-                                   '-chapter-', '-chap-', '-chuong-'))
-    else:
-        valid = candidate_path.startswith(series_path + '/')
+    # Three sites use different chapter-link formats. Require the SAME series
+    # prefix, so a link to another comic can never leak into this chapter list.
+    base = series_path.removesuffix('.html')
+    valid = (candidate_path.startswith(series_path + '/') or
+             candidate_path.startswith(base + '/') or
+             candidate_path.startswith(base + '-chapter-') or
+             candidate_path.startswith(base + '-chap-') or
+             candidate_path.startswith(base + '-chuong-'))
+    # Some hosts append "-chap-1.html" to the end of the series slug.
+    if valid and not re.search(r'(?:chapter|chap|chuong)[/_ -]*\d', candidate_path, re.I):
+        valid = False
     if not valid:
         return None
     found = CHAPTER_RE.findall((text or '') + ' ' + candidate_path.replace('-', ' ').replace('_', ' '))
@@ -177,23 +181,27 @@ def read_manifest(folder: Path) -> dict:
         return {}
 
 
+MANIFEST_LOCK = __import__('threading').RLock()
+
 def write_manifest_entry(folder: Path, chapter: str, url: str, file: Path, expected: int, matched: int,
-                         reader_urls: list[str] | None = None):
-    folder.mkdir(parents=True, exist_ok=True)
-    data = read_manifest(folder)
-    data[chapter] = {'url': url, 'file': file.name, 'size': file.stat().st_size,
-                     'version': VERSION, 'expected': expected, 'matched': matched,
-                     'reader_urls': reader_urls or [],
-                     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')}
-    tmp = manifest_path(folder).with_suffix('.json.tmp')
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
-    os.replace(tmp, manifest_path(folder))
+                         reader_urls: list[str] | None = None, ads_filtered: bool = False):
+    with MANIFEST_LOCK:
+        folder.mkdir(parents=True, exist_ok=True)
+        data = read_manifest(folder)
+        data[chapter] = {'url': url, 'file': file.name, 'size': file.stat().st_size,
+                         'version': VERSION, 'expected': expected, 'matched': matched,
+                         'reader_urls': reader_urls or [], 'ads_filtered': bool(ads_filtered),
+                         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')}
+        tmp = manifest_path(folder).with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
+        os.replace(tmp, manifest_path(folder))
 
 
-def completed(folder: Path, chapter: str, url: str, file: Path) -> bool:
+def completed(folder: Path, chapter: str, url: str, file: Path, require_ad_free: bool = False) -> bool:
     entry = read_manifest(folder).get(chapter)
     return (isinstance(entry, dict) and entry.get('url') == url
-            and entry.get('version') in ('2.0.0', '2.1.0', '2.2.0', '2.3.0', VERSION) and entry.get('file') == file.name
+            and entry.get('version') in ('2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0', '2.5.0', VERSION) and entry.get('file') == file.name
+            and (not require_ad_free or bool(entry.get('ads_filtered', False)))
             and entry.get('expected', 0) > 0
             and entry.get('expected') == entry.get('matched')
             and file.is_file() and file.stat().st_size > 1500
@@ -426,7 +434,7 @@ def wait_for_reader(page, log, stop, max_seconds=155) -> dict:
 
 # ---- Windows UI and browser controller ----
 
-"""TruyenSaver Chromium Offline 2.4 (Windows).
+"""TruyenSaver Chromium Offline 3.0 (Windows).
 
 Runs a bundled Chromium using a private persistent profile through CDP.
 No desktop keyboard or mouse simulation, no Chromium installation required.
@@ -452,7 +460,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 APP_NAME = 'TruyenSaver Chromium Offline'
 CONFIG_DIR = Path(os.getenv('APPDATA') or Path.home()) / 'TruyenSaverChromium'
 PROFILE_DIR = CONFIG_DIR / 'Profile_v2_3'
-SETTINGS = CONFIG_DIR / 'settings_v2_3.json'
+SETTINGS = CONFIG_DIR / 'settings_v3.json'
 LEGACY_SETTINGS = Path(os.getenv('APPDATA') or Path.home()) / 'TruyenSaverCocCoc' / 'settings_v2.json'
 
 
@@ -566,8 +574,85 @@ class ChromiumEngine:
         raise RuntimeError('Chromium đi kèm không bật được chế độ điều khiển chạy nền.')
 
 
-def capture_verified_blob(page, expected: dict, log) -> tuple[bytes, ArchiveCheck]:
+# Remove advertisement nodes from rendered page *after* image URLs were determined.
+# Conservatively retain all ancestors of the verified comic images, and preserve
+# the actual pixels of the comic artwork. No adblock network rules are applied:
+# blocking requests can break legitimate comic images on third-party CDNs.
+REMOVE_ADS_JS = r'''(expectedUrls) => {
+  function normalizeImageUrl(value) {
+    if (!value) return '';
+    try {
+      const parsed = new URL(value, location.href);
+      if (parsed.protocol === 'data:') return value;
+      parsed.hash = '';
+      let path = parsed.pathname;
+      try { path = decodeURIComponent(path); } catch (_) {}
+      return parsed.origin + path + parsed.search;
+    } catch (_) { return value; }
+  }
+  const allow = new Set((expectedUrls || []).map(normalizeImageUrl));
+  const protectedNodes = new Set();
+  function isComicImage(img) {
+    return [img.currentSrc, img.src, img.getAttribute('data-src'),
+            img.getAttribute('data-original'), img.getAttribute('data-lazy-src')]
+           .some(value => allow.has(normalizeImageUrl(value)));
+  }
+  for (const img of document.querySelectorAll('img')) {
+    if (!isComicImage(img)) continue;
+    let node = img;
+    while (node) { protectedNodes.add(node); node = node.parentElement; }
+  }
+  const adsClass = /(?:^|[-_\s])(?:ad|ads|adslot|adunit|adbox|advert|advertisement|advertising|banner|sponsor|sponsored|popunder|popup)(?:$|[-_\s0-9])/i;
+  const adsUrl = /(?:doubleclick\.net|googlesyndication\.com|googleadservices\.com|adsystem|adservice|\/(?:ads?|banner|advertisement)(?:\/|\?|\.|-|_))/i;
+  const safeRemove = (node) => {
+    if (!node || protectedNodes.has(node) || !node.parentNode ||
+        node === document.body || node === document.documentElement) return false;
+    node.remove(); return true;
+  };
+  // First remove declared ad slots, ad iframes, and labeled overlay containers.
+  const candidates = [...document.querySelectorAll('body *')];
+  let removed = 0, floating = 0;
+  for (const node of candidates) {
+    if (!node.isConnected || protectedNodes.has(node)) continue;
+    const tag = node.tagName.toLowerCase();
+    const label = [node.id || '', typeof node.className === 'string' ? node.className : '',
+                   node.getAttribute('aria-label') || ''].join(' ');
+    const src = node.getAttribute('src') || '';
+    const href = node.getAttribute('href') || '';
+    const tagged = adsClass.test(label) || (tag === 'iframe' && adsUrl.test(src));
+    const namedAdResource = (tag === 'img' || tag === 'iframe') && adsUrl.test(src);
+    // Do not remove any generic element just because it contains an ad link;
+    // this prevents stripping whole comic navigation/reader containers.
+    if ((tagged || namedAdResource) && safeRemove(node)) removed++;
+  }
+  // A floating ad may have an arbitrary class and an image/banner as content.
+  // Restrict this rule to fixed/sticky small docked panels, outside reader images.
+  for (const node of [...document.querySelectorAll('body *')]) {
+    if (!node.isConnected || protectedNodes.has(node)) continue;
+    if (!node.querySelector('img,iframe') && !['IMG','IFRAME'].includes(node.tagName)) continue;
+    const style = getComputedStyle(node);
+    if (style.position !== 'fixed' && style.position !== 'sticky') continue;
+    const rect = node.getBoundingClientRect();
+    if (rect.width < 140 || rect.height < 28 || rect.height > innerHeight * 0.42 ||
+        rect.top > innerHeight || rect.bottom < innerHeight - 175) continue;
+    // Ignore extremely large wrappers, which can be modal comic viewers.
+    if (rect.width * rect.height > innerWidth * innerHeight * .50) continue;
+    if (safeRemove(node)) floating++;
+  }
+  return {removed, floating, protected: protectedNodes.size};
+}'''
+
+
+def capture_verified_blob(page, expected: dict, log, strip_ads: bool = True) -> tuple[bytes, ArchiveCheck]:
     """Take a CDP snapshot and verify its exact reader-image resources before writing."""
+    if strip_ads:
+        try:
+            cleaned = page.evaluate(REMOVE_ADS_JS, expected['urls'])
+            log('    Đã lọc quảng cáo trước khi lưu: '
+                f"{cleaned['removed']} ô quảng cáo, {cleaned['floating']} banner nổi.")
+        except Exception as exc:
+            # Explicitly refuse a supposedly ad-free snapshot if DOM cleaning fails.
+            raise RuntimeError('Không áp dụng được bộ lọc quảng cáo: ' + str(exc)) from exc
     session = page.context.new_cdp_session(page)
     try:
         data = session.send('Page.captureSnapshot', {'format': 'mhtml'})['data'].encode('utf-8')
@@ -726,14 +811,43 @@ def _pdf_probe(resource: bytes) -> tuple[int, int]:
     return size
 
 
-def pdf_from_mhtml(blob: bytes, reader_urls: list[str], target: Path, stop=None) -> int:
-    """Export scrolling webtoon PDF, never cutting any original image.
+def plan_continuous_pdf(sizes: list[tuple[int, int]], target_width=800.,
+                        max_height=13500., min_width=24.) -> list[tuple[float,float,list[int]]]:
+    """Plan continuous *chapter pages*, never break through source pixels.
 
-    The images are joined top-to-bottom without borders or A4 slicing. Pages
-    are long digital-only pages, assembled from whole source images. Each page
-    has a maximum height within PDF viewer limits; breaks happen ONLY between
-    source images, never inside artwork. An exceptionally long source image
-    becomes its own page with a narrower physical page width so it still fits.
+    Most chapters fit on ONE tall PDF page by scaling PDF coordinates (NOT
+    downsampling raster artwork). For ultra-long chapters, group whole images
+    into the fewest pages possible. Viewer page-gaps may remain at boundaries.
+    """
+    if not sizes or any(w <= 0 or h <= 0 for w,h in sizes):
+        raise ValueError('Ảnh có kích thước không hợp lệ')
+    ratios = [h / w for w,h in sizes]
+    total_ratio = sum(ratios)
+    width = min(float(target_width), float(max_height) / total_ratio)
+    if width >= min_width:
+        return [(width, width*total_ratio, list(range(len(sizes))))]
+    # Fall back for a chapter too long even at the supported minimum width.
+    out=[]; group=[]; ratio_sum=0.
+    for idx,r in enumerate(ratios):
+        if group and (ratio_sum + r) * min_width > max_height:
+            out.append((min_width, min_width*ratio_sum, group))
+            group=[]; ratio_sum=0.
+        group.append(idx); ratio_sum+=r
+        if ratio_sum * min_width > max_height:  # Single exceptionally tall source image.
+            actual_width = max_height / ratio_sum
+            out.append((actual_width, max_height, group))
+            group=[]; ratio_sum=0.
+    if group:
+        out.append((min_width, min_width*ratio_sum, group))
+    return out
+
+
+def pdf_from_mhtml(blob: bytes, reader_urls: list[str], target: Path, stop=None) -> int:
+    """Export borderless vertical PDF without A4 page cuts.
+
+    Draws each source image unchanged at matching aspect ratio onto ONE very
+    long PDF page per chapter in normal cases. Changing the PDF coordinate
+    width does not reduce the resolution of embedded source images.
     """
     import base64
     from urllib.parse import unquote_to_bytes
@@ -742,89 +856,63 @@ def pdf_from_mhtml(blob: bytes, reader_urls: list[str], target: Path, stop=None)
 
     check = verify_mhtml(blob, reader_urls)
     if not check.ok:
-        raise ValueError('Không xuất PDF vì ảnh trong MHTML chưa đủ: ' + check.explanation)
+        raise ValueError('Không xuất PDF vì ảnh MHTML chưa đủ: ' + check.explanation)
     images = _mhtml_images(blob)
-    urls = list(dict.fromkeys(normalize_url(url) for url in reader_urls if url))
+    urls = [normalize_url(u) for u in reader_urls if u]  # Preserve repeated panels.
     if not urls:
-        raise ValueError('Không có ảnh truyện để xuất PDF.')
-
-    # PDF points, not pixels. A long page is far better for scrolling readers.
-    target_width = 800.0
-    max_height = 12000.0  # Below PDF's conventional 14400pt page limit.
-    pages_plan = []
-    group = []
-    used_height = 0.0
-    image_count = 0
-
+        raise ValueError('Không tìm thấy ảnh truyện để xuất PDF.')
+    resources=[]; sizes=[]
     for url in urls:
         if stop is not None and stop.is_set():
             raise InterruptedError('Đã dừng xuất PDF')
-        resource = images.get(url)
-        if resource is None and url.startswith('data:image/'):
-            prefix, comma, data = url.partition(',')
+        raw=images.get(url)
+        if raw is None and url.startswith('data:image/'):
+            prefix, comma, encoded = url.partition(',')
             if comma:
-                resource = base64.b64decode(data, validate=True) if ';base64' in prefix else unquote_to_bytes(data)
-        if not resource:
-            raise ValueError('PDF thiếu ảnh từ MHTML: ' + url[:130])
-        # Plan layout first, without keeping hundreds of decoded images in RAM.
-        px_width, px_height = _pdf_probe(resource)
-        image_height = float(target_width * px_height / px_width)
-        if image_height > max_height:
-            if group:
-                pages_plan.append((target_width, used_height, group))
-                group, used_height = [], 0.0
-            exact_width = max_height * px_width / px_height
-            pages_plan.append((exact_width, max_height, [(resource, max_height)]))
-        else:
-            if group and used_height + image_height > max_height:
-                pages_plan.append((target_width, used_height, group))
-                group, used_height = [], 0.0
-            group.append((resource, image_height))
-            used_height += image_height
-        image_count += 1
-    if group:
-        pages_plan.append((target_width, used_height, group))
-    if not pages_plan or image_count != len(urls):
-        raise RuntimeError(f'PDF thiếu ảnh: {image_count}/{len(urls)}')
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(target.name + '.part')
-    temporary.unlink(missing_ok=True)
+                raw=(base64.b64decode(encoded, validate=True) if ';base64' in prefix
+                     else unquote_to_bytes(encoded))
+        if not raw:
+            raise ValueError('Thiếu ảnh khi tạo PDF: '+url[:130])
+        sizes.append(_pdf_probe(raw)); resources.append(raw)
+    plan=plan_continuous_pdf(sizes)
+    target.parent.mkdir(parents=True,exist_ok=True)
+    tmp=target.with_name(target.name+'.part')
+    tmp.unlink(missing_ok=True)
     try:
-        pdf = canvas.Canvas(str(temporary), pagesize=(target_width, 1000), pageCompression=1)
+        pdf=canvas.Canvas(str(tmp), pagesize=(800,800),pageCompression=1)
         pdf.setTitle(target.stem)
-        for width_pts, height_pts, items in pages_plan:
+        for width,height,indices in plan:
             if stop is not None and stop.is_set():
                 raise InterruptedError('Đã dừng xuất PDF')
-            pdf.setPageSize((width_pts, height_pts))
-            top = height_pts
-            for resource, draw_h in items:
+            pdf.setPageSize((width,height))
+            y=height
+            for idx in indices:
                 if stop is not None and stop.is_set():
                     raise InterruptedError('Đã dừng xuất PDF')
-                image, _, _ = _pdf_image_reader(resource)
-                top -= draw_h
-                # Zero margins. Each image joins the next like a scrolling web page.
-                pdf.drawImage(image, 0, max(0.0, top),
-                              width=width_pts, height=draw_h, mask='auto')
+                image,_,_=_pdf_image_reader(resources[idx])
+                w,h=sizes[idx]
+                draw_height=width*h/w
+                y-=draw_height
+                # Subpixel overlap eliminates antialiasing hairlines between
+                # panels in many PDF viewers without cropping image content.
+                pdf.drawImage(image,0,max(0.,y-0.008),width=width,
+                              height=draw_height+0.016,mask='auto')
             pdf.showPage()
         pdf.save()
-        with temporary.open('rb') as file:
-            reader = PdfReader(file, strict=False)
-            count = len(reader.pages)
-            # Count draw instructions, not unique embedded images: PDF correctly
-            # de-duplicates identical image XObjects even when drawn many times.
-            drawn = 0
+        with tmp.open('rb') as fd:
+            reader=PdfReader(fd,strict=False)
+            if len(reader.pages)!=len(plan):
+                raise RuntimeError('PDF thiếu trang')
             import re
-            for page in reader.pages:
-                contents = page.get_contents()
-                raw = contents.get_data() if contents is not None else b''
-                drawn += len(re.findall(rb'/[^\s/]+\s+Do\b', raw))
-        if count != len(pages_plan) or drawn < image_count or temporary.stat().st_size < 1500:
-            raise RuntimeError(f'PDF bị thiếu lệnh vẽ ảnh hoặc không hợp lệ: {drawn}/{image_count}')
-        os.replace(temporary, target)
-        return count
+            drawn=sum(len(re.findall(rb'/[^\s/]+\s+Do\b',
+                      p.get_contents().get_data() if p.get_contents() is not None else b''))
+                      for p in reader.pages)
+        if drawn<len(urls) or tmp.stat().st_size<1500:
+            raise RuntimeError(f'PDF thiếu ảnh: {drawn}/{len(urls)}')
+        os.replace(tmp,target)
+        return len(plan)
     finally:
-        temporary.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
 
 def read_pdf_manifest(folder: Path) -> dict:
     try:
@@ -857,15 +945,16 @@ def pdf_completed(folder: Path, chapter: str, url: str, target: Path) -> bool:
 
 def write_pdf_manifest(folder: Path, chapter: str, url: str, path: Path,
                        image_count: int, page_count: int) -> None:
-    folder.mkdir(parents=True, exist_ok=True)
-    data = read_pdf_manifest(folder)
-    data[chapter] = {'url': url, 'file': path.name, 'bytes': path.stat().st_size,
-                     'source_count': image_count, 'pages': page_count,
-                     'sha256': _sha256_file(path),
-                     'render_version': PDF_RENDER_VERSION, 'version': VERSION, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')}
-    tmp = folder / 'TIEN_DO_PDF.json.tmp'
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(tmp, folder / 'TIEN_DO_PDF.json')
+    with MANIFEST_LOCK:
+        folder.mkdir(parents=True, exist_ok=True)
+        data = read_pdf_manifest(folder)
+        data[chapter] = {'url': url, 'file': path.name, 'bytes': path.stat().st_size,
+                         'source_count': image_count, 'pages': page_count,
+                         'sha256': _sha256_file(path),
+                         'render_version': PDF_RENDER_VERSION, 'version': VERSION, 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')}
+        tmp = folder / 'TIEN_DO_PDF.json.tmp'
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        os.replace(tmp, folder / 'TIEN_DO_PDF.json')
 
 
 def combined_pdf_name(chapters: list[dict]) -> str:
@@ -913,15 +1002,45 @@ def merge_chapter_pdfs(folder: Path, chapters: list[dict], output: Path, stop=No
         writer.close()
 
 
+def merged_cache_folder(folder: Path, chapters: list[dict]) -> Path:
+    import hashlib
+    data='\n'.join(str(c['number'])+'|'+c['url'] for c in chapters)
+    digest=hashlib.sha256(data.encode('utf-8')).hexdigest()[:12]
+    return folder / '.truyensaver_cache' / digest
+
+
+def merged_completed(folder: Path, chapters: list[dict], output: Path) -> bool:
+    metadata=folder / 'TIEN_DO_GOP.json'
+    try:
+        entry=json.loads(metadata.read_text(encoding='utf-8'))
+        expected=[str(c['number'])+'|'+c['url'] for c in chapters]
+        return (entry.get('input') == expected and
+                entry.get('render_version') == PDF_RENDER_VERSION and
+                entry.get('output') == output.name and output.is_file() and
+                output.stat().st_size == entry.get('size') and
+                entry.get('sha256') == _sha256_file(output))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def record_merged(folder: Path, chapters: list[dict], output: Path) -> None:
+    info={'input':[str(c['number'])+'|'+c['url'] for c in chapters],
+          'render_version':PDF_RENDER_VERSION,'output':output.name,
+          'size':output.stat().st_size,'sha256':_sha256_file(output),
+          'timestamp':time.strftime('%Y-%m-%d %H:%M:%S')}
+    tmp=folder/'TIEN_DO_GOP.json.tmp'
+    tmp.write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
+    os.replace(tmp,folder/'TIEN_DO_GOP.json')
+
 def write_index_formats(folder: Path, title: str, chapters: list[dict], fmt: str,
-                        combined: Path | None = None) -> None:
-    use_mhtml = fmt in ('mhtml','both')
-    use_pdf = fmt in ('pdf','both')
+                        combined: Path | None = None, require_ad_free: bool = False) -> None:
+    use_mhtml = fmt == 'mhtml'
+    use_pdf = fmt == 'pdf'
     entries = []
     for chap in chapters:
         number = chapter_label(chap['number'])
         links = []
-        if use_mhtml and completed(folder, number, chap['url'], folder / f'Chap_{number}.mhtml'):
+        if use_mhtml and completed(folder, number, chap['url'], folder / f'Chap_{number}.mhtml', require_ad_free=require_ad_free):
             links.append(f'<a href="Chap_{html.escape(number, quote=True)}.mhtml">MHTML (offline)</a>')
         if use_pdf and pdf_completed(folder, number, chap['url'], folder / f'Chap_{number}.pdf'):
             links.append(f'<a href="Chap_{html.escape(number, quote=True)}.pdf">PDF</a>')
@@ -941,7 +1060,7 @@ def write_index_formats(folder: Path, title: str, chapters: list[dict], fmt: str
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(f'{APP_NAME} v{VERSION}')
+        self.root.title(f'TruyenSaver PRO v{VERSION} — Chromium')
         self.root.geometry('960x820')
         self.root.minsize(850, 720)
         self.eventq = queue.Queue()
@@ -954,7 +1073,10 @@ class App:
         self.end_var = tk.StringVar(value=str(self.settings.get('end', '100')))
         self.status_var = tk.StringVar(value='Sẵn sàng – hãy thử 1–2 chap trước')
         self.format_var = tk.StringVar(value=self.settings.get('format', 'MHTML (đọc offline)'))
-        self.merge_var = tk.BooleanVar(value=bool(self.settings.get('merge_pdf', True)))
+        if self.format_var.get() not in ('MHTML (đọc offline)', 'PDF riêng (mỗi chap)', 'PDF gộp (1 tệp)'):
+            self.format_var.set('MHTML (đọc offline)')
+        self.workers_var = tk.StringVar(value=str(self.settings.get('workers', '2')))
+        self.ad_free_var = tk.BooleanVar(value=bool(self.settings.get('remove_ads', True)))
         self._ui()
         self.links.insert('1.0', self.settings.get('links', 'https://damconuong.cool/truyen/ban-hoc'))
         root.after(120, self._drain)
@@ -963,11 +1085,11 @@ class App:
     def _ui(self):
         main = ttk.Frame(self.root, padding=16)
         main.pack(fill='both', expand=True)
-        ttk.Label(main, text='TruyenSaver – Chromium Offline', font=('Segoe UI', 19, 'bold')).pack(anchor='w')
-        ttk.Label(main, text='Chạy nền • MHTML offline • PDF cuộn dọc, không cắt ảnh',
+        ttk.Label(main, text='TruyenSaver PRO — Chromium Offline', font=('Segoe UI', 19, 'bold')).pack(anchor='w')
+        ttk.Label(main, text='Chạy nền • 3 nguồn truyện • PDF một trang dài cho mỗi chap • Tiếp tục tải',
                   foreground='#34526a').pack(anchor='w', pady=(3,12))
-        ttk.Label(main, text='Link trang danh sách truyện (mỗi dòng một bộ truyện, hỗ trợ hai website):').pack(anchor='w')
-        self.links = tk.Text(main, height=3, font=('Segoe UI', 10), wrap='word')
+        ttk.Label(main, text='Link trang danh sách truyện (mỗi dòng một bộ truyện, hỗ trợ ba website):').pack(anchor='w')
+        self.links = tk.Text(main, height=3, font=('Segoe UI', 10), wrap='word', background='#FFFFFF', foreground='#111827', relief='flat', padx=9, pady=9)
         self.links.pack(fill='x', pady=(3,9))
         range_frame = ttk.Frame(main)
         range_frame.pack(fill='x', pady=4)
@@ -982,17 +1104,20 @@ class App:
         ttk.Entry(folder, textvariable=self.folder_var).pack(side='left', fill='x', expand=True)
         ttk.Button(folder, text='Chọn thư mục', command=self._choose_folder).pack(side='left', padx=5)
         ttk.Button(folder, text='Mở thư mục', command=self._open_folder).pack(side='left')
+        ttk.Button(folder, text='Đọc offline', command=self._read_offline).pack(side='left', padx=(5,0))
         fmt_frame = ttk.LabelFrame(main, text='Định dạng muốn tải', padding=(12,8))
         fmt_frame.pack(fill='x', pady=(11,5))
         ttk.Label(fmt_frame, text='Kiểu lưu:').pack(side='left', padx=(0,6))
         self.mode_box = ttk.Combobox(fmt_frame, textvariable=self.format_var, state='readonly',
-                                     values=('MHTML (đọc offline)', 'PDF (mỗi chap)', 'MHTML + PDF'), width=23)
-        self.mode_box.pack(side='left', padx=(0,18))
-        self.mode_box.bind('<<ComboboxSelected>>', lambda _: self._sync_format())
-        self.merge_box = ttk.Checkbutton(fmt_frame, text='Gộp toàn bộ chap thành một PDF',
-                                         variable=self.merge_var)
-        self.merge_box.pack(side='left')
-        self._sync_format()
+                        values=('MHTML (đọc offline)', 'PDF riêng (mỗi chap)', 'PDF gộp (1 tệp)'), width=25)
+        self.mode_box.pack(side='left', padx=(0,22))
+        ttk.Label(fmt_frame,text='Chương tải đồng thời:').pack(side='left',padx=(0,8))
+        self.workers_box=ttk.Combobox(fmt_frame,textvariable=self.workers_var,
+                                      state='readonly', values=('1','2','3'), width=4)
+        self.workers_box.pack(side='left')
+        ttk.Label(fmt_frame,text='Mặc định 2; giảm xuống 1 nếu web chậm.').pack(side='left',padx=(12,0))
+        ttk.Checkbutton(main, text='Lọc quảng cáo khi lưu MHTML (PDF chỉ lấy ảnh trong vùng đọc)',
+                        variable=self.ad_free_var).pack(anchor='w', pady=(5,0))
         ttk.Label(main, text='Chromium đi kèm ứng dụng • chạy nền, không cần cài thêm trình duyệt.',
                   foreground='#34526a').pack(anchor='w', pady=(9,2))
         controls = ttk.Frame(main)
@@ -1000,8 +1125,9 @@ class App:
         self.buttons = []
         for label, func in [('Mở Chromium để đăng nhập', self.login),
                             ('Quét danh sách chap', self.scan),
-                            ('BẮT ĐẦU LƯU OFFLINE', self.download)]:
-            btn = ttk.Button(controls, text=label, command=func)
+                            ('BẮT ĐẦU TẢI TRUYỆN', self.download)]:
+            btn = ttk.Button(controls, text=label, command=func,
+                             style='Primary.TButton' if func == self.download else 'TButton')
             btn.pack(side='left', padx=(0,8))
             self.buttons.append(btn)
         self.stop_button = ttk.Button(controls, text='DỪNG', command=self.stop, state='disabled')
@@ -1010,14 +1136,13 @@ class App:
         self.progress = ttk.Progressbar(main, mode='determinate')
         self.progress.pack(fill='x', pady=(2,9))
         ttk.Label(main, text='Nhật ký tải truyện:', font=('Segoe UI',10,'bold')).pack(anchor='w')
-        self.logs = scrolledtext.ScrolledText(main, height=14, font=('Consolas', 9), state='disabled', wrap='word')
+        self.logs = scrolledtext.ScrolledText(main, height=14, font=('Consolas', 9), state='disabled', wrap='word', background='#FFFFFF', foreground='#1F2937', relief='flat', padx=9, pady=9)
         self.logs.pack(fill='both', expand=True, pady=(5,7))
-        ttk.Label(main, text='PDF liền mạch: ghép ảnh nguyên vẹn trên trang dài, không cắt ảnh theo khổ A4. '
-                  'Tùy chọn gộp chỉ xuất khi đủ tất cả chap đã chọn. Hãy thử offline 1–2 chap trước.',
+        ttk.Label(main, text='PDF: một trang dài cho mỗi chap khi có thể, không cắt theo khổ A4. '
+                  'Quảng cáo được lọc trước khi lưu MHTML; quảng cáo in sẵn trong ảnh truyện sẽ không thể loại tự động. '
+                  'Hãy thử offline 1–2 chap trước.',
                   foreground='#755215', wraplength=900).pack(anchor='w')
 
-    def _sync_format(self):
-        self.merge_box.configure(state='disabled' if self.format_var.get() == 'MHTML (đọc offline)' else 'normal')
 
     def _load_settings(self):
         for path in (SETTINGS, LEGACY_SETTINGS):
@@ -1035,7 +1160,8 @@ class App:
             'start': self.start_var.get().strip(),
             'end': self.end_var.get().strip(),
             'links': self.links.get('1.0','end').strip(),
-            'format': self.format_var.get(), 'merge_pdf': self.merge_var.get()}, indent=2, ensure_ascii=False), encoding='utf-8')
+            'format': self.format_var.get(), 'workers': self.workers_var.get(),
+            'remove_ads': bool(self.ad_free_var.get())}, indent=2, ensure_ascii=False), encoding='utf-8')
 
     def _choose_folder(self):
         path = filedialog.askdirectory(title='Chọn thư mục lưu truyện',
@@ -1051,6 +1177,32 @@ class App:
             os.startfile(str(path))
         else:
             messagebox.showinfo('Thư mục', str(path))
+
+    def _read_offline(self):
+        """Open newest saved comic index in bundled Chromium, no browser install."""
+        folder=Path(self.folder_var.get().strip()).expanduser()
+        if not folder.is_dir():
+            messagebox.showinfo('Chưa có truyện','Hãy chọn thư mục truyện đã lưu.')
+            return
+        indexes=sorted(folder.rglob('MUC_LUC.html'),
+                       key=lambda path:path.stat().st_mtime,reverse=True)
+        if not indexes:
+            messagebox.showinfo('Chưa có mục lục MHTML',
+                                'Chưa tìm thấy MUC_LUC.html trong thư mục. '                                'Nếu bạn chọn PDF, hãy dùng Mở thư mục để mở tệp PDF.')
+            return
+        try:
+            executable=chromium_executable()
+            reader_profile=CONFIG_DIR/'OfflineReaderProfile'
+            reader_profile.mkdir(parents=True,exist_ok=True)
+            args=[executable,'--no-first-run','--no-default-browser-check',
+                  '--user-data-dir='+str(reader_profile),
+                  '--allow-file-access-from-files', indexes[0].as_uri()]
+            if sys.platform != 'win32' and hasattr(os,'geteuid') and os.geteuid()==0:
+                args.insert(1,'--no-sandbox')
+            subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                             creationflags=(0x08000000 if sys.platform=='win32' else 0))
+        except Exception as exc:
+            messagebox.showerror('Không mở được trình đọc',str(exc))
 
     def _emit(self, kind: str, *args):
         self.eventq.put((kind, args))
@@ -1097,16 +1249,18 @@ class App:
         folder = Path(self.folder_var.get().strip()).expanduser().resolve()
         folder.mkdir(parents=True, exist_ok=True)
         self._save_settings()
-        modes = {'MHTML (đọc offline)': 'mhtml', 'PDF (mỗi chap)': 'pdf', 'MHTML + PDF': 'both'}
-        mode = modes.get(self.format_var.get(), 'both')
-        merge = bool(self.merge_var.get()) and mode in ('pdf', 'both')
-        return urls, start, end, folder, mode, merge
+        modes = {'MHTML (đọc offline)': 'mhtml', 'PDF riêng (mỗi chap)': 'pdf', 'PDF gộp (1 tệp)': 'merged'}
+        mode = modes[self.format_var.get()]
+        workers = int(self.workers_var.get())
+        if workers not in (1, 2, 3):
+            raise ValueError('Số luồng phải từ 1 đến 3')
+        return urls, start, end, folder, mode, workers, bool(self.ad_free_var.get())
 
     def _run(self, action):
         if self.busy:
             return
         try:
-            urls, start, end, folder, mode, merge = self._fields()
+            urls, start, end, folder, mode, workers, strip_ads = self._fields()
         except Exception as exc:
             messagebox.showerror('Thiếu thông tin', str(exc))
             return
@@ -1118,7 +1272,7 @@ class App:
         def worker():
             msg='Xong'
             try:
-                msg = action(urls, start, end, folder, mode, merge) or msg
+                msg = action(urls, start, end, folder, mode, workers, strip_ads) or msg
             except InterruptedError:
                 self.log('Đã dừng theo yêu cầu. Các chap đã lưu vẫn được giữ lại.')
                 msg='Đã dừng'
@@ -1134,7 +1288,7 @@ class App:
         self.log('Đang yêu cầu dừng ở bước an toàn...')
 
     def login(self):
-        def action(urls,start,end,folder,mode,merge):
+        def action(urls,start,end,folder,mode,workers,strip_ads):
             self.browser.ensure(visible=True)
             self.log('Đã mở Chromium với hồ sơ riêng. Hãy đăng nhập nếu website yêu cầu.')
             self.log('Đóng cửa sổ Chromium đăng nhập trước khi bấm Quét/Bắt đầu; hồ sơ vẫn được lưu.')
@@ -1179,7 +1333,7 @@ class App:
                          + ('...' if len(missing_nums)>25 else ''))
         return title, chapters
 
-    def _scan(self, urls, start, end, folder, mode, merge):
+    def _scan(self, urls, start, end, folder, mode, workers, strip_ads):
         port, handle = self._connect()
         with handle as play:
             browser = play.chromium.connect_over_cdp(f'http://127.0.0.1:{port}', timeout=15000)
@@ -1193,130 +1347,186 @@ class App:
                 page.close()
         return 'Đã quét xong'
 
-    def _download(self, urls, start, end, root, mode, merge):
-        port, handle = self._connect()
-        summary = []
-        want_mhtml = mode in ('mhtml', 'both')
-        want_pdf = mode in ('pdf', 'both')
-        with handle as play:
-            browser = play.chromium.connect_over_cdp(f'http://127.0.0.1:{port}', timeout=15000)
-            page = browser.contexts[0].new_page()
+    def _process_chapter(self, port, dest: Path, chap: dict, mode: str,
+                         strip_ads: bool, source_dir: Path | None = None) -> tuple[bool, str]:
+        """Independent CDP connection per worker; no global mouse/keyboard use."""
+        from playwright.sync_api import sync_playwright
+        number=chapter_label(chap['number'])
+        url=chap['url']
+        source_dir=source_dir or dest
+        archive=source_dir/f'Chap_{number}.mhtml'
+        target=dest/f'Chap_{number}.pdf'
+        if mode=='mhtml' and completed(source_dir,number,url,archive,require_ad_free=strip_ads):
+            return True, f'Chap {number}: MHTML đã có và hợp lệ.'
+        if mode in ('pdf','merged') and pdf_completed(dest,number,url,target):
+            return True, f'Chap {number}: PDF đã có và hợp lệ.'
+        # Reuse older verified MHTML if PDF is required; never WRITE an
+        # unwanted MHTML when user selects PDF-only.
+        if mode!='mhtml' and completed(source_dir,number,url,archive):
             try:
-                for url in urls:
+                blob=archive.read_bytes()
+                entry=read_manifest(source_dir).get(number) or {}
+                img_urls=entry.get('reader_urls') or offline_reader_urls(blob,url,int(entry.get('expected') or 0))
+                if img_urls and verify_mhtml(blob,img_urls).ok:
+                    pages=pdf_from_mhtml(blob,img_urls,target,self.cancel)
+                    write_pdf_manifest(dest,number,url,target,len(img_urls),pages)
+                    return True, f'Chap {number}: tái sử dụng MHTML cũ, PDF {pages} trang.'
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                self.log(f'Chap {number}: MHTML cũ chưa đủ, tải lại ({exc}).')
+        with sync_playwright() as driver:
+            browser=driver.chromium.connect_over_cdp(f'http://127.0.0.1:{port}',timeout=20000)
+            page=browser.contexts[0].new_page()
+            try:
+                for attempt in range(3):
                     if self.cancel.is_set():
-                        raise InterruptedError()
+                        raise InterruptedError('Đã yêu cầu dừng')
                     try:
-                        title, chapters = self._discover(page, url, start, end)
+                        self.log(f'Chap {number}: tải lượt {attempt+1}/3 ...')
+                        response=page.goto(url,wait_until='domcontentloaded',timeout=55000)
+                        if response and response.status in (401,403):
+                            raise RuntimeError(f'Website yêu cầu đăng nhập hoặc từ chối HTTP {response.status}')
+                        if response and response.status in (429,500,502,503,504):
+                            raise RuntimeError(f'Website quá tải / giới hạn tốc độ HTTP {response.status}')
+                        page.wait_for_timeout(350)
+                        reader=wait_for_reader(page,self.log,self.cancel,max_seconds=(65,90,110)[attempt])
+                        blob,check=capture_verified_blob(page,reader,self.log,strip_ads=strip_ads)
+                        if mode=='mhtml':
+                            save_atomic_bytes(blob,archive)
+                            write_manifest_entry(source_dir,number,url,archive,check.expected,check.matched,
+                                                 reader['urls'],ads_filtered=strip_ads)
+                            if not completed(source_dir,number,url,archive,require_ad_free=strip_ads):
+                                raise RuntimeError('Chưa xác nhận được MHTML đã lưu')
+                            return True,f'Chap {number}: lưu MHTML đủ {check.matched} ảnh.'
+                        pages=pdf_from_mhtml(blob,reader['urls'],target,self.cancel)
+                        write_pdf_manifest(dest,number,url,target,len(reader['urls']),pages)
+                        if not pdf_completed(dest,number,url,target):
+                            raise RuntimeError('Chưa xác nhận được PDF đã lưu')
+                        return True,f'Chap {number}: PDF {pages} trang dài, {check.matched} ảnh.'
+                    except InterruptedError:
+                        raise
                     except Exception as exc:
-                        self.log(f'Không quét được {url}: {exc}')
-                        summary.append(f'{url}: quét thất bại')
-                        continue
-                    dest = root / sanitize(urlsplit(url).hostname or 'Web') / title
-                    dest.mkdir(parents=True, exist_ok=True)
-                    done, failed = 0, []
-                    merged_file = None
-                    for idx, chap in enumerate(chapters, 1):
-                        if self.cancel.is_set():
-                            raise InterruptedError()
-                        number = chapter_label(chap['number'])
-                        archive = dest / f'Chap_{number}.mhtml'
-                        pdf_file = dest / f'Chap_{number}.pdf'
-                        self._emit('progress', idx-1, len(chapters),
-                                   f'{title}: Chap {number} ({idx}/{len(chapters)})')
-                        needs_mhtml = want_mhtml and not completed(dest, number, chap['url'], archive)
-                        needs_pdf = want_pdf and not pdf_completed(dest, number, chap['url'], pdf_file)
-                        # Rebuild A4 PDFs as seamless PDFs from verified saved MHTML,
-                        # without re-downloading any artwork, where possible.
-                        if needs_pdf and archive.is_file() and completed(dest, number, chap['url'], archive):
-                            try:
-                                old_blob = archive.read_bytes()
-                                entry = read_manifest(dest).get(number) or {}
-                                image_urls = entry.get('reader_urls') or offline_reader_urls(
-                                    old_blob, chap['url'], int(entry.get('expected') or 0))
-                                if not image_urls or not verify_mhtml(old_blob, image_urls).ok:
-                                    raise ValueError('Không khôi phục được danh sách ảnh từ MHTML cũ')
-                                pages = pdf_from_mhtml(old_blob, image_urls, pdf_file, self.cancel)
-                                write_pdf_manifest(dest, number, chap['url'], pdf_file,
-                                                   len(image_urls), pages)
-                                needs_pdf = False
-                                self.log(f'Chap {number}: đã tạo PDF liền mạch trực tiếp từ MHTML cũ ({pages} trang).')
-                            except InterruptedError:
-                                raise
-                            except Exception as exc:
-                                self.log(f'Chap {number}: không dùng lại được MHTML, sẽ tải lại: {exc}')
-
-                        if not needs_mhtml and not needs_pdf:
-                            self.log(f'Chap {number}: đã có đủ định dạng, bỏ qua.')
-                            done += 1
-                            self._emit('progress', idx, len(chapters),
-                                       f'{title}: {idx}/{len(chapters)}, đã hoàn tất {done}')
-                            continue
-                        try:
-                            for attempt in range(2):
-                                if self.cancel.is_set():
-                                    raise InterruptedError()
-                                try:
-                                    self.log(f'Chap {number}: đang tải ảnh, lượt {attempt+1}/2...')
-                                    page.goto(chap['url'], wait_until='domcontentloaded', timeout=60000)
-                                    page.wait_for_timeout(500)
-                                    reader = wait_for_reader(page, self.log, self.cancel, max_seconds=125)
-                                    blob, check = capture_verified_blob(page, reader, self.log)
-                                    if needs_mhtml:
-                                        save_atomic_bytes(blob, archive)
-                                        write_manifest_entry(dest, number, chap['url'], archive,
-                                                             check.expected, check.matched, reader['urls'])
-                                        self.log(f'    Lưu offline: {archive.name} ({check.matched} ảnh).')
-                                    if needs_pdf:
-                                        pages = pdf_from_mhtml(blob, reader['urls'], pdf_file, self.cancel)
-                                        write_pdf_manifest(dest, number, chap['url'], pdf_file,
-                                                           len(reader['urls']), pages)
-                                        self.log(f'    PDF liền mạch: {pdf_file.name}, {pages} trang dài (không cắt ảnh).')
-                                    break
-                                except InterruptedError:
-                                    raise
-                                except Exception as exc:
-                                    if attempt == 1:
-                                        raise
-                                    self.log(f'    Thử lại vì: {exc}')
-                                    page.wait_for_timeout(700)
-                            ok_archive = (not want_mhtml or completed(dest, number, chap['url'], archive))
-                            ok_pdf = (not want_pdf or pdf_completed(dest, number, chap['url'], pdf_file))
-                            if not (ok_archive and ok_pdf):
-                                raise RuntimeError('Tệp đã lưu chưa qua xác nhận.')
-                            done += 1
-                        except InterruptedError:
+                        self.log(f'Chap {number}: lỗi lượt {attempt+1}: {exc}')
+                        if attempt==2:
                             raise
-                        except Exception as exc:
-                            failed.append(f'Chap {number}: {exc}')
-                            self.log(f'CHƯA HOÀN TẤT CHAP {number}: {exc}')
-                        self._emit('progress', idx, len(chapters),
-                                   f'{title}: {idx}/{len(chapters)}, hoàn tất {done}')
-                        write_index_formats(dest, title, chapters, mode)
-                    if want_pdf and merge:
-                        name = combined_pdf_name(chapters)
-                        merged_file = dest / name
-                        try:
-                            total_pages = merge_chapter_pdfs(dest, chapters, merged_file, self.cancel)
-                            self.log(f'Đã tạo PDF gộp: {merged_file.name} ({total_pages} trang).')
-                        except InterruptedError:
-                            raise
-                        except Exception as exc:
-                            # Do not leave a stale merged PDF looking complete.
-                            merged_file.unlink(missing_ok=True)
-                            merged_file = None
-                            self.log(f'Không gộp PDF: {exc}')
-                            failed.append(f'Gộp PDF: {exc}')
-                    write_index_formats(dest, title, chapters, mode, merged_file)
-                    (dest / 'BAO_CAO.txt').write_text('\n'.join([
-                        f'TruyenSaver v{VERSION}', f'Truyện: {title}', f'Website: {url}',
-                        f'Định dạng: {mode}', f'Hoàn tất: {done}/{len(chapters)} chap',
-                        f'PDF gộp: {merged_file.name if merged_file else "không có"}',
-                        'Các chap lỗi cần chạy lại:'] + (failed or ['Không có'])), encoding='utf-8')
-                    summary.append(f'{title}: {done}/{len(chapters)} chap')
-                    self.log(f'{title}: hoàn tất {done}/{len(chapters)}; thư mục {dest}')
+                        # Backoff prevents hammering a temporarily overloaded host.
+                        for _ in range((attempt+1)*4):
+                            if self.cancel.is_set():
+                                raise InterruptedError('Đã dừng')
+                            time.sleep(.5)
             finally:
-                page.close()
-        return ' | '.join(summary) + ' – hãy kiểm tra tệp đầu ra'
+                try: page.close()
+                except Exception: pass
+
+    def _download(self, urls, start, end, root, mode, workers, strip_ads):
+        """One fair global queue for all sites. Two different sites can run at once."""
+        import shutil
+        from itertools import zip_longest
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        port, handle=self._connect()
+        specifications=[]; results=[]
+        # Discover sequentially (lightweight), then interleave chapter jobs
+        # across series to avoid starving the second website.
+        with handle as driver:
+            browser=driver.chromium.connect_over_cdp(f'http://127.0.0.1:{port}',timeout=20000)
+            scan_page=browser.contexts[0].new_page()
+            try:
+                for series_url in urls:
+                    if self.cancel.is_set():
+                        raise InterruptedError('Đã yêu cầu dừng')
+                    try:
+                        title,chapters=self._discover(scan_page,series_url,start,end)
+                    except Exception as exc:
+                        self.log(f'Không quét được {series_url}: {exc}')
+                        results.append(series_url+': không tìm được chap')
+                        continue
+                    dest=root/sanitize(urlsplit(series_url).hostname or 'web')/title
+                    dest.mkdir(parents=True,exist_ok=True)
+                    combined=dest/combined_pdf_name(chapters)
+                    if mode=='merged' and merged_completed(dest,chapters,combined):
+                        self.log(f'{title}: đã có PDF gộp hợp lệ, bỏ qua toàn bộ.')
+                        results.append(f'{title}: PDF gộp đã có')
+                        continue
+                    work_dir=merged_cache_folder(dest,chapters) if mode=='merged' else dest
+                    work_dir.mkdir(parents=True,exist_ok=True)
+                    spec={'url':series_url,'title':title,'chapters':chapters,'dest':dest,
+                          'cache':work_dir,'combined':combined,'done':0,'failed':[]}
+                    specifications.append(spec)
+                    self.log(f'{title}: {len(chapters)} chap, chế độ {mode}.')
+            finally:
+                scan_page.close()
+
+            if not specifications:
+                return ' | '.join(results) or 'Không tìm được chương để tải.'
+            workers=max(1,min(3,int(workers)))
+            total=sum(len(spec['chapters']) for spec in specifications)
+            finished=0
+            self.log(f'Bắt đầu {total} chap từ {len(specifications)} nguồn; {workers} tác vụ song song.')
+            with ThreadPoolExecutor(max_workers=workers,thread_name_prefix='truyensaver') as pool:
+                jobs={}
+                # Round-robin ordering is important: the first two jobs can
+                # belong to two different websites when two series are queued.
+                for row in zip_longest(*(spec['chapters'] for spec in specifications)):
+                    for spec,chap in zip(specifications,row):
+                        if chap is None:
+                            continue
+                        future=pool.submit(self._process_chapter,port,spec['cache'],chap,mode,strip_ads,spec['dest'])
+                        jobs[future]=(spec,chap)
+                for future in as_completed(jobs):
+                    spec,chap=jobs[future]
+                    number=chapter_label(chap['number'])
+                    try:
+                        ok,message=future.result()
+                        if ok:
+                            spec['done']+=1
+                        self.log(spec['title']+': '+message)
+                    except InterruptedError:
+                        self.cancel.set()
+                    except Exception as exc:
+                        item=f'Chap {number}: {exc}'
+                        spec['failed'].append(item)
+                        self.log(spec['title']+': CHƯA HOÀN TẤT '+item)
+                    finished+=1
+                    self._emit('progress',finished,total,
+                               f'Đã xử lý {finished}/{total} chap — thành công '
+                               f'{sum(x["done"] for x in specifications)}')
+            if self.cancel.is_set():
+                raise InterruptedError('Đã dừng. Bộ nhớ đệm được giữ để tiếp tục sau.')
+            for spec in specifications:
+                chapters=spec['chapters']; dest=spec['dest']; title=spec['title']
+                done=spec['done']; failed=spec['failed']; work_dir=spec['cache']
+                merged_target=spec['combined']
+                if mode=='merged':
+                    if done==len(chapters):
+                        try:
+                            pages=merge_chapter_pdfs(work_dir,chapters,merged_target,self.cancel)
+                            record_merged(dest,chapters,merged_target)
+                            self.log(f'{title}: PDF gộp {merged_target.name}, {pages} trang.')
+                            shutil.rmtree(work_dir,ignore_errors=True)
+                            root_cache=dest/'.truyensaver_cache'
+                            if root_cache.is_dir() and not any(root_cache.iterdir()):
+                                root_cache.rmdir()
+                        except Exception as exc:
+                            merged_target.unlink(missing_ok=True)
+                            failed.append(f'Gộp PDF: {exc}')
+                    else:
+                        merged_target.unlink(missing_ok=True)
+                        failed.append(f'Gộp PDF: thiếu {len(chapters)-done} chap chưa xác minh')
+                        self.log(f'{title}: giữ PDF trung gian trong .truyensaver_cache để chạy lại.')
+                elif mode=='mhtml':
+                    write_index_formats(dest,title,chapters,'mhtml',require_ad_free=strip_ads)
+                else:
+                    write_index_formats(dest,title,chapters,'pdf')
+                (dest/'BAO_CAO.txt').write_text('\n'.join([
+                    f'TruyenSaver v{VERSION}', f'Tên truyện: {title}', f'Nguồn: {spec["url"]}',
+                    f'Định dạng: {mode}',f'Đã xác minh: {done}/{len(chapters)} chap',
+                    f'PDF gộp: {merged_target.name if mode=="merged" and merged_target.exists() else "không có"}',
+                    'Các chương lỗi cần thử lại:']+(failed or ['Không có'])),encoding='utf-8')
+                results.append(f'{title}: {done}/{len(chapters)} chap')
+                self.log(f'{title}: {done}/{len(chapters)}; thư mục {dest}')
+        return ' | '.join(results) + ' — xem BAO_CAO.txt để kiểm tra'
 
     def _close(self):
         if self.busy:
@@ -1331,11 +1541,78 @@ class App:
         self.root.destroy()
 
 
-if __name__ == '__main__':
-    window = tk.Tk()
+
+# Self-test is safe and network-free. The GitHub Windows runner runs this on
+# the *built EXE* to catch missing Chromium or packaging errors before upload.
+def portable_self_test() -> int:
+    from playwright.sync_api import sync_playwright
+    engine=ChromiumEngine()
     try:
-        ttk.Style().theme_use('clam')
+        executable=chromium_executable()
+        if not Path(executable).exists():
+            raise RuntimeError('No bundled Chromium executable')
+        port=engine.ensure(visible=False)
+        with sync_playwright() as driver:
+            browser=driver.chromium.connect_over_cdp(f'http://127.0.0.1:{port}',timeout=15000)
+            page=browser.contexts[0].new_page()
+            try:
+                page.set_content('<!doctype html><html><body><h1>TruyenSaver PRO</h1></body></html>')
+                if page.locator('h1').inner_text()!='TruyenSaver PRO':
+                    raise RuntimeError('Chromium page test failed')
+                session=page.context.new_cdp_session(page)
+                try:
+                    blob=session.send('Page.captureSnapshot',{'format':'mhtml'})['data']
+                finally:
+                    session.detach()
+                if 'multipart/related' not in blob:
+                    raise RuntimeError('MHTML snapshot test failed')
+            finally:
+                page.close()
+        return 0
+    except Exception as exc:
+        try:
+            p=Path(os.getenv('TEMP') or str(Path.home()))/'TruyenSaver_PRO_selftest_error.txt'
+            p.write_text(str(exc),encoding='utf-8')
+        except Exception:
+            pass
+        return 1
+    finally:
+        engine.close()
+
+def apply_app_style(root):
+    """Lightweight native Windows-style theme, no extra UI dependencies."""
+    theme=ttk.Style(root)
+    try:
+        theme.theme_use('clam')
     except tk.TclError:
         pass
+    background='#F5F7FB'
+    root.configure(background=background)
+    theme.configure('.',font=('Segoe UI',10))
+    theme.configure('TFrame',background=background)
+    theme.configure('TLabel',background=background,foreground='#1F2937')
+    theme.configure('TLabelframe',background=background,bordercolor='#D4DCE8')
+    theme.configure('TLabelframe.Label',background=background,foreground='#1B3A61',
+                    font=('Segoe UI',10,'bold'))
+    theme.configure('TButton',background='#E4EAF3',foreground='#26364C',
+                    borderwidth=0,padding=(12,8))
+    theme.map('TButton',background=[('active','#CCD8E8'),('disabled','#E9EDF2')],
+              foreground=[('disabled','#9BA8B9')])
+    theme.configure('Primary.TButton',background='#2167D9',foreground='#FFFFFF',
+                    borderwidth=0,padding=(18,9),font=('Segoe UI',10,'bold'))
+    theme.map('Primary.TButton',background=[('active','#174DA7'),('disabled','#AFC1DC')],
+              foreground=[('active','#FFFFFF')])
+    theme.configure('TEntry',fieldbackground='#FFFFFF',padding=(5,5))
+    theme.configure('TCombobox',fieldbackground='#FFFFFF',padding=(5,5))
+    theme.configure('TCheckbutton',background=background,foreground='#334155')
+    theme.configure('Horizontal.TProgressbar',background='#2475EC',
+                    troughcolor='#DEE5F0',borderwidth=0,thickness=10)
+
+
+if __name__ == '__main__':
+    if '--self-test' in sys.argv:
+        sys.exit(portable_self_test())
+    window = tk.Tk()
+    apply_app_style(window)
     App(window)
     window.mainloop()
