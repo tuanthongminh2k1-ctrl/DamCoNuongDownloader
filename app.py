@@ -22,8 +22,8 @@ from email.parser import BytesParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
-VERSION = '3.1.0'
-PDF_RENDER_VERSION = 'single-continuous-page-v3'
+VERSION = '4.0.0'
+PDF_RENDER_VERSION = 'reader-width-balanced-v4'
 SUPPORTED_HOSTS = ('damconuong.cool', 'sayhentai.cx', 'hentaicube.xyz')
 CHAPTER_RE = re.compile(r'(?:chap(?:ter)?|chương|chuong)\s*[:#\-_. ]*\s*(\d+(?:[.,]\d+)?)', re.I)
 
@@ -80,7 +80,11 @@ def chapter_from_anchor(text: str, link: str, series_url: str) -> float | None:
         valid = False
     if not valid:
         return None
-    found = CHAPTER_RE.findall((text or '') + ' ' + candidate_path.replace('-', ' ').replace('_', ' '))
+    # Prefer visible chapter text: it preserves decimals such as 1.5 even
+    # when the URL spells the chapter as chapter-1-5.
+    found = CHAPTER_RE.findall(text or '')
+    if not found:
+        found = CHAPTER_RE.findall(candidate_path.replace('-', ' ').replace('_', ' '))
     if not found:
         return None
     try:
@@ -200,7 +204,7 @@ def write_manifest_entry(folder: Path, chapter: str, url: str, file: Path, expec
 def completed(folder: Path, chapter: str, url: str, file: Path, require_ad_free: bool = False) -> bool:
     entry = read_manifest(folder).get(chapter)
     return (isinstance(entry, dict) and entry.get('url') == url
-            and entry.get('version') in ('2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0', '2.5.0', VERSION) and entry.get('file') == file.name
+            and entry.get('version') in ('2.0.0', '2.1.0', '2.2.0', '2.3.0', '2.4.0', '2.5.0', '3.0.0', '3.1.0', VERSION) and entry.get('file') == file.name
             and (not require_ad_free or bool(entry.get('ads_filtered', False)))
             and entry.get('expected', 0) > 0
             and entry.get('expected') == entry.get('matched')
@@ -393,7 +397,7 @@ def wait_for_reader(page, log, stop, max_seconds=155) -> dict:
             if (confirm.get('missing') == 0 and
                     confirm.get('ready') == confirm.get('total') and
                     reader_signature(confirm) == sig):
-                urls = list(dict.fromkeys(normalize_url(x['src']) for x in confirm['images']))
+                urls = [normalize_url(x['src']) for x in confirm['images']]  # Keep repeated panels in their original order.
                 if urls:
                     log(f"    Ảnh truyện đã tải ổn định: {confirm['ready']}/{confirm['total']}; "
                         f"đã kiểm tra ảnh cuối vùng đọc (không phụ thuộc chân trang web).")
@@ -467,8 +471,52 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 APP_NAME = 'TruyenSaver Chromium Offline'
 CONFIG_DIR = Path(os.getenv('APPDATA') or Path.home()) / 'TruyenSaverChromium'
 PROFILE_DIR = CONFIG_DIR / 'Profile_v2_3'
-SETTINGS = CONFIG_DIR / 'settings_v3.json'
+SETTINGS = CONFIG_DIR / 'settings_v4.json'
+PREVIOUS_SETTINGS = CONFIG_DIR / 'settings_v3.json'
 LEGACY_SETTINGS = Path(os.getenv('APPDATA') or Path.home()) / 'TruyenSaverCocCoc' / 'settings_v2.json'
+
+
+def asset_path(name: str) -> Path:
+    root = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
+    return root / 'assets' / name
+
+
+class HostHealth:
+    """Thread-safe, per-host retry cooldown. Never intentionally bypass access controls."""
+    def __init__(self):
+        self._lock=threading.RLock()
+        self._failures={}
+        self._until={}
+
+    def wait(self, url, stop):
+        host=urlsplit(url).hostname or ''
+        while True:
+            if stop.is_set():
+                raise InterruptedError('Đã dừng trong khi chờ phục hồi mạng')
+            with self._lock:
+                remaining=self._until.get(host,0)-time.monotonic()
+            if remaining<=0:
+                return
+            stop.wait(min(0.3,remaining))
+
+    def failed(self,url,kind='network'):
+        host=urlsplit(url).hostname or ''
+        with self._lock:
+            n=min(5,self._failures.get(host,0)+1)
+            self._failures[host]=n
+            delay=min(28., 1.75*(2**(n-1))) if kind!='forbidden' else 0.
+            self._until[host]=max(self._until.get(host,0),time.monotonic()+delay)
+            return delay
+
+    def succeeded(self,url):
+        host=urlsplit(url).hostname or ''
+        with self._lock:
+            self._failures[host]=0
+            self._until[host]=0
+
+    def reduced_concurrency(self,url):
+        with self._lock:
+            return self._failures.get(urlsplit(url).hostname or '',0)>=2
 
 
 def configure_chromium_path():
@@ -845,108 +893,131 @@ def _pdf_probe(resource: bytes) -> tuple[int, int]:
     return size
 
 
-def plan_continuous_pdf(sizes: list[tuple[int, int]], target_width=800.,
-                        max_height=13500., min_width=24.) -> list[tuple[float,float,list[int]]]:
-    """Plan continuous *chapter pages*, never break through source pixels.
+def plan_continuous_pdf(sizes: list[tuple[int, int]], target_width=720.,
+                        max_height=2500., min_width=240.) -> list[tuple[float,float,list[int]]]:
+    """Keep readable pages, with breaks only *between* source images.
 
-    Most chapters fit on ONE tall PDF page by scaling PDF coordinates (NOT
-    downsampling raster artwork). For ultra-long chapters, group whole images
-    into the fewest pages possible. Viewer page-gaps may remain at boundaries.
+    An extremely tall single input is handled separately by pdf_from_mhtml,
+    because shrinking it to <240 pt recreates the user's illegibly thin PDFs.
     """
     if not sizes or any(w <= 0 or h <= 0 for w,h in sizes):
-        raise ValueError('Ảnh có kích thước không hợp lệ')
-    ratios = [h / w for w,h in sizes]
-    total_ratio = sum(ratios)
-    width = min(float(target_width), float(max_height) / total_ratio)
-    if width >= min_width:
-        return [(width, width*total_ratio, list(range(len(sizes))))]
-    # Fall back for a chapter too long even at the supported minimum width.
-    out=[]; group=[]; ratio_sum=0.
-    for idx,r in enumerate(ratios):
-        if group and (ratio_sum + r) * min_width > max_height:
-            out.append((min_width, min_width*ratio_sum, group))
-            group=[]; ratio_sum=0.
-        group.append(idx); ratio_sum+=r
-        if ratio_sum * min_width > max_height:  # Single exceptionally tall source image.
-            actual_width = max_height / ratio_sum
-            out.append((actual_width, max_height, group))
-            group=[]; ratio_sum=0.
+        raise ValueError('Kích thước ảnh không hợp lệ')
+    out=[]; group=[]; sumratio=0.
+    for idx,(w,h) in enumerate(sizes):
+        ratio=h/w
+        if ratio*target_width > max_height+0.1:
+            raise ValueError('Ảnh đơn quá dài: hãy chia ảnh thành các mảnh trước khi lập trang PDF')
+        if group and (sumratio+ratio)*target_width>max_height:
+            out.append((target_width,target_width*sumratio,group))
+            group=[]; sumratio=0.
+        group.append(idx); sumratio+=ratio
+        if sumratio*target_width>max_height:
+            # Caller slices excessive single sources into overlapped chunks.
+            if len(group)>1:
+                raise ValueError('Cần phân nhóm ảnh theo giới hạn trang')
+            out.append((target_width,target_width*sumratio,group))
+            group=[];sumratio=0.
     if group:
-        out.append((min_width, min_width*ratio_sum, group))
+        out.append((target_width,target_width*sumratio,group))
     return out
 
 
-def pdf_from_mhtml(blob: bytes, reader_urls: list[str], target: Path, stop=None) -> int:
-    """Export borderless vertical PDF without A4 page cuts.
+def _source_slices(raw: bytes, max_ratio=3.45):
+    """Split only an exceptionally tall *single image*; preserve every source row.
 
-    Draws each source image unchanged at matching aspect ratio onto ONE very
-    long PDF page per chapter in normal cases. Changing the PDF coordinate
-    width does not reduce the resolution of embedded source images.
+    Prefer near-white horizontal rows for natural breaks. No row is discarded.
+    Extremely tall scans cannot be one readable PDF page in all viewers.
+    """
+    import io
+    from PIL import Image
+    with Image.open(io.BytesIO(raw)) as source:
+        source.load()
+        w,h=source.size
+        max_px=max(1,int(w*max_ratio))
+        if h<=max_px:
+            return [raw]
+        pieces=[]; top=0
+        while top<h:
+            target=min(top+max_px,h)
+            if target<h:
+                # Low-information horizontal scanlines make better page breaks.
+                # Search only 8% around target, avoid costly full image scans.
+                search_start=max(top+max_px//2,target-max_px//15)
+                search_end=min(h-1,target+max_px//15)
+                best=(float('inf'),target)
+                sample_step=max(1,w//120)
+                for y in range(search_start,search_end, max(1,(search_end-search_start)//28)):
+                    band=source.crop((0,y,w,min(h,y+2))).convert('RGB')
+                    colors=list(band.getdata())[::sample_step]
+                    if not colors:continue
+                    dark=sum(255-max(pixel) for pixel in colors)/len(colors)
+                    if dark<best[0]:best=(dark,y)
+                target=max(top+1,best[1])
+            part=source.crop((0,top,w,target))
+            buf=io.BytesIO();part.save(buf,format='PNG',compress_level=3)
+            pieces.append(buf.getvalue())
+            top=target
+        return pieces
+
+
+def pdf_from_mhtml(blob: bytes, reader_urls: list[str], target: Path, stop=None) -> int:
+    """Readable borderless PDF. Keeps image order and original full pixels.
+
+    Page width fixed at 720pt, page height <= ~2500pt: viewers won't shrink
+    an entire chapter of 100 images into an unreadable thin strip.
     """
     import base64
     from urllib.parse import unquote_to_bytes
     from reportlab.pdfgen import canvas
     from pypdf import PdfReader
-
     if stop is not None and stop.is_set():
-        raise InterruptedError('Đã dừng trước khi xử lý PDF')
-    check = verify_mhtml(blob, reader_urls)
+        raise InterruptedError('Đã dừng PDF')
+    check=verify_mhtml(blob, reader_urls)
     if not check.ok:
-        raise ValueError('Không xuất PDF vì ảnh MHTML chưa đủ: ' + check.explanation)
-    images = _mhtml_images(blob)
-    urls = [normalize_url(u) for u in reader_urls if u]  # Preserve repeated panels.
-    if not urls:
-        raise ValueError('Không tìm thấy ảnh truyện để xuất PDF.')
-    resources=[]; sizes=[]
+        raise ValueError('MHTML chưa đủ ảnh: '+check.explanation)
+    mapping=_mhtml_images(blob)
+    urls=[normalize_url(x) for x in reader_urls if x]
+    if not urls:raise ValueError('Không có ảnh truyện')
+    pieces=[]; sizes=[]
     for url in urls:
-        if stop is not None and stop.is_set():
-            raise InterruptedError('Đã dừng xuất PDF')
-        raw=images.get(url)
+        if stop is not None and stop.is_set():raise InterruptedError('Đã dừng PDF')
+        raw=mapping.get(url)
         if raw is None and url.startswith('data:image/'):
-            prefix, comma, encoded = url.partition(',')
+            prefix,comma,value=url.partition(',')
             if comma:
-                raw=(base64.b64decode(encoded, validate=True) if ';base64' in prefix
-                     else unquote_to_bytes(encoded))
-        if not raw:
-            raise ValueError('Thiếu ảnh khi tạo PDF: '+url[:130])
-        sizes.append(_pdf_probe(raw)); resources.append(raw)
+                raw=(base64.b64decode(value,validate=True) if ';base64' in prefix
+                     else unquote_to_bytes(value))
+        if not raw:raise ValueError('Thiếu tài nguyên ảnh: '+url[:120])
+        for piece in _source_slices(raw):
+            sizes.append(_pdf_probe(piece));pieces.append(piece)
     plan=plan_continuous_pdf(sizes)
     target.parent.mkdir(parents=True,exist_ok=True)
     tmp=target.with_name(target.name+'.part')
     tmp.unlink(missing_ok=True)
     try:
-        pdf=canvas.Canvas(str(tmp), pagesize=(800,800),pageCompression=1)
-        pdf.setTitle(target.stem)
+        doc=canvas.Canvas(str(tmp),pagesize=(720,1200),pageCompression=1)
+        doc.setTitle(target.stem)
         for width,height,indices in plan:
-            if stop is not None and stop.is_set():
-                raise InterruptedError('Đã dừng xuất PDF')
-            pdf.setPageSize((width,height))
-            y=height
+            if stop is not None and stop.is_set():raise InterruptedError('Đã dừng PDF')
+            doc.setPageSize((width,height))
+            cursor=height
             for idx in indices:
-                if stop is not None and stop.is_set():
-                    raise InterruptedError('Đã dừng xuất PDF')
-                image,_,_=_pdf_image_reader(resources[idx])
+                if stop is not None and stop.is_set():raise InterruptedError('Đã dừng PDF')
+                image,_,_=_pdf_image_reader(pieces[idx])
                 w,h=sizes[idx]
-                draw_height=width*h/w
-                y-=draw_height
-                # Subpixel overlap eliminates antialiasing hairlines between
-                # panels in many PDF viewers without cropping image content.
-                pdf.drawImage(image,0,max(0.,y-0.008),width=width,
-                              height=draw_height+0.016,mask='auto')
-            pdf.showPage()
-        pdf.save()
-        with tmp.open('rb') as fd:
-            reader=PdfReader(fd,strict=False)
-            if len(reader.pages)!=len(plan):
-                raise RuntimeError('PDF thiếu trang')
-            import re
-            drawn=sum(len(re.findall(rb'/[^\s/]+\s+Do\b',
-                      p.get_contents().get_data() if p.get_contents() is not None else b''))
-                      for p in reader.pages)
-        if drawn<len(urls) or tmp.stat().st_size<1500:
-            raise RuntimeError(f'PDF thiếu ảnh: {drawn}/{len(urls)}')
-        if stop is not None and stop.is_set():
-            raise InterruptedError('Đã dừng trước khi hoàn tất PDF')
+                dh=width*h/w
+                cursor-=dh
+                doc.drawImage(image,0,max(0.,cursor-0.004),width=width,height=dh+0.008,mask='auto')
+            doc.showPage()
+        doc.save()
+        with tmp.open('rb') as inp:
+            pdf=PdfReader(inp,strict=False)
+            if len(pdf.pages)!=len(plan):raise RuntimeError('Số trang PDF không đúng')
+            for pg in pdf.pages:
+                if float(pg.mediabox.width)<300 or float(pg.mediabox.height)>2700:
+                    raise RuntimeError('PDF có kích thước trang bất thường')
+        if tmp.stat().st_size<1500:raise RuntimeError('PDF trống')
+        if stop is not None and stop.is_set():raise InterruptedError('Đã dừng PDF')
         os.replace(tmp,target)
         return len(plan)
     finally:
@@ -1100,9 +1171,9 @@ def write_index_formats(folder: Path, title: str, chapters: list[dict], fmt: str
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(f'TruyenSaver PRO v{VERSION} — Chromium')
-        self.root.geometry('960x820')
-        self.root.minsize(850, 720)
+        self.root.title(f'TruyenSaver PRO v{VERSION} — Hsin Moon Fox')
+        self.root.geometry('1050x890')
+        self.root.minsize(950, 740)
         self.eventq = queue.Queue()
         self.cancel = threading.Event()
         self._futures_lock = threading.RLock()
@@ -1119,75 +1190,204 @@ class App:
             self.format_var.set('MHTML (đọc offline)')
         self.workers_var = tk.StringVar(value=str(self.settings.get('workers', '2')))
         self.ad_free_var = tk.BooleanVar(value=bool(self.settings.get('remove_ads', True)))
+        self.theme_var = tk.StringVar(value=self.settings.get('theme', 'Hsin • Moon Fox'))
+        self.scanned = {}
+        self.scan_selection = set()
+        self.selection_snapshot = None
+        self.row_key_to_ref = {}
+        self.chapter_states = {}
+        self.host_health = HostHealth()
         self._ui()
         self.links.insert('1.0', self.settings.get('links', 'https://damconuong.cool/truyen/ban-hoc'))
         root.after(120, self._drain)
         root.protocol('WM_DELETE_WINDOW', self._close)
 
     def _ui(self):
-        main = ttk.Frame(self.root, padding=16)
-        main.pack(fill='both', expand=True)
-        ttk.Label(main, text='TruyenSaver PRO — Chromium Offline', font=('Segoe UI', 19, 'bold')).pack(anchor='w')
-        ttk.Label(main, text='Chạy nền • 3 nguồn truyện • PDF một trang dài cho mỗi chap • Tiếp tục tải',
-                  foreground='#34526a').pack(anchor='w', pady=(3,12))
-        ttk.Label(main, text='Link trang danh sách truyện (mỗi dòng một bộ truyện, hỗ trợ ba website):').pack(anchor='w')
-        self.links = tk.Text(main, height=3, font=('Segoe UI', 10), wrap='word', background='#FFFFFF', foreground='#111827', relief='flat', padx=9, pady=9)
-        self.links.pack(fill='x', pady=(3,9))
-        range_frame = ttk.Frame(main)
-        range_frame.pack(fill='x', pady=4)
-        ttk.Label(range_frame, text='Từ chap:').pack(side='left')
-        ttk.Entry(range_frame, textvariable=self.start_var, width=10).pack(side='left', padx=(7,22))
-        ttk.Label(range_frame, text='Đến chap:').pack(side='left')
-        ttk.Entry(range_frame, textvariable=self.end_var, width=10).pack(side='left', padx=(7,22))
-        ttk.Label(range_frame, text='Chỉ tải các chương có trên website; không tự tạo chap thiếu.').pack(side='left')
-        ttk.Label(main, text='Thư mục lưu truyện:').pack(anchor='w', pady=(9,2))
-        folder = ttk.Frame(main)
-        folder.pack(fill='x')
-        ttk.Entry(folder, textvariable=self.folder_var).pack(side='left', fill='x', expand=True)
-        ttk.Button(folder, text='Chọn thư mục', command=self._choose_folder).pack(side='left', padx=5)
-        ttk.Button(folder, text='Mở thư mục', command=self._open_folder).pack(side='left')
-        ttk.Button(folder, text='Đọc offline', command=self._read_offline).pack(side='left', padx=(5,0))
-        fmt_frame = ttk.LabelFrame(main, text='Định dạng muốn tải', padding=(12,8))
-        fmt_frame.pack(fill='x', pady=(11,5))
-        ttk.Label(fmt_frame, text='Kiểu lưu:').pack(side='left', padx=(0,6))
-        self.mode_box = ttk.Combobox(fmt_frame, textvariable=self.format_var, state='readonly',
-                        values=('MHTML (đọc offline)', 'PDF riêng (mỗi chap)', 'PDF gộp (1 tệp)'), width=25)
-        self.mode_box.pack(side='left', padx=(0,22))
-        ttk.Label(fmt_frame,text='Chương tải đồng thời:').pack(side='left',padx=(0,8))
-        self.workers_box=ttk.Combobox(fmt_frame,textvariable=self.workers_var,
-                                      state='readonly', values=('1','2','3'), width=4)
-        self.workers_box.pack(side='left')
-        ttk.Label(fmt_frame,text='Mặc định 2; giảm xuống 1 nếu web chậm.').pack(side='left',padx=(12,0))
-        ttk.Checkbutton(main, text='Lọc quảng cáo khi lưu MHTML (PDF chỉ lấy ảnh trong vùng đọc)',
-                        variable=self.ad_free_var).pack(anchor='w', pady=(5,0))
-        ttk.Label(main, text='Chromium đi kèm ứng dụng • chạy nền, không cần cài thêm trình duyệt.',
-                  foreground='#34526a').pack(anchor='w', pady=(9,2))
-        controls = ttk.Frame(main)
-        controls.pack(fill='x', pady=(14,8))
-        self.buttons = []
-        for label, func in [('Mở Chromium để đăng nhập', self.login),
-                            ('Quét danh sách chap', self.scan),
-                            ('BẮT ĐẦU TẢI TRUYỆN', self.download)]:
-            btn = ttk.Button(controls, text=label, command=func,
-                             style='Primary.TButton' if func == self.download else 'TButton')
-            btn.pack(side='left', padx=(0,8))
+        self.main=ttk.Frame(self.root,padding=(18,12))
+        self.main.pack(fill='both',expand=True)
+        self.banner=tk.Canvas(self.main,height=122,bd=0,highlightthickness=0)
+        self.banner.pack(fill='x',pady=(0,10))
+        self._paint_banner()
+        headline=ttk.Frame(self.main)
+        headline.pack(fill='x',pady=(0,6))
+        ttk.Label(headline,text='Nguồn truyện · mỗi dòng một đường dẫn',style='Header.TLabel').pack(side='left')
+        ttk.Label(headline,text='Giao diện',style='Muted.TLabel').pack(side='right',padx=(8,2))
+        self.theme_box=ttk.Combobox(headline,textvariable=self.theme_var,state='readonly',
+                    values=('Hsin • Moon Fox','Tối','Sáng'),width=17)
+        self.theme_box.pack(side='right')
+        self.theme_box.bind('<<ComboboxSelected>>',self._change_theme)
+        self.links=tk.Text(self.main,height=2,font=('Segoe UI',10),wrap='word',relief='flat',padx=10,pady=7)
+        self.links.pack(fill='x',pady=(2,8))
+        options=ttk.Frame(self.main)
+        options.pack(fill='x',pady=(2,5))
+        ttk.Label(options,text='Từ chap').pack(side='left')
+        ttk.Entry(options,textvariable=self.start_var,width=8).pack(side='left',padx=(5,10))
+        ttk.Label(options,text='Đến').pack(side='left')
+        ttk.Entry(options,textvariable=self.end_var,width=8).pack(side='left',padx=(5,16))
+        ttk.Label(options,text='Chế độ').pack(side='left')
+        self.mode_box=ttk.Combobox(options,textvariable=self.format_var,state='readonly',
+                        values=('MHTML (đọc offline)','PDF riêng (mỗi chap)','PDF gộp (1 tệp)'),width=24)
+        self.mode_box.pack(side='left',padx=(5,10))
+        ttk.Label(options,text='Song song').pack(side='left')
+        self.workers_box=ttk.Combobox(options,textvariable=self.workers_var,state='readonly',
+                                     values=('1','2','3'),width=3)
+        self.workers_box.pack(side='left',padx=(5,8))
+        folder_line=ttk.Frame(self.main)
+        folder_line.pack(fill='x',pady=(3,6))
+        ttk.Label(folder_line,text='Thư mục lưu').pack(side='left',padx=(0,8))
+        ttk.Entry(folder_line,textvariable=self.folder_var).pack(side='left',fill='x',expand=True)
+        ttk.Button(folder_line,text='Chọn thư mục',command=self._choose_folder).pack(side='left',padx=(6,4))
+        ttk.Button(folder_line,text='Mở',command=self._open_folder).pack(side='left')
+        ttk.Checkbutton(self.main,text='Lọc quảng cáo trước khi lưu (không sửa ảnh gốc)',
+                        variable=self.ad_free_var).pack(anchor='w',pady=(0,8))
+        controls=ttk.Frame(self.main)
+        controls.pack(fill='x',pady=(0,9))
+        self.buttons=[]
+        for label,func in [('Đăng nhập (nếu cần)',self.login),('QUÉT DANH SÁCH CHAP',self.scan),
+                           ('BẮT ĐẦU TẢI',self.download)]:
+            btn=ttk.Button(controls,text=label,command=func,
+                           style='Primary.TButton' if func==self.download else 'TButton')
+            btn.pack(side='left',padx=(0,8))
             self.buttons.append(btn)
-        self.stop_button = ttk.Button(controls, text='DỪNG', command=self.stop, state='disabled')
+        self.stop_button=ttk.Button(controls,text='DỪNG TẤT CẢ',command=self.stop,state='disabled',style='Stop.TButton')
         self.stop_button.pack(side='left')
-        ttk.Label(main, textvariable=self.status_var).pack(anchor='w', pady=(5,3))
-        self.progress = ttk.Progressbar(main, mode='determinate')
-        self.progress.pack(fill='x', pady=(2,9))
-        ttk.Label(main, text='Nhật ký tải truyện:', font=('Segoe UI',10,'bold')).pack(anchor='w')
-        self.logs = scrolledtext.ScrolledText(main, height=14, font=('Consolas', 9), state='disabled', wrap='word', background='#FFFFFF', foreground='#1F2937', relief='flat', padx=9, pady=9)
-        self.logs.pack(fill='both', expand=True, pady=(5,7))
-        ttk.Label(main, text='PDF: một trang dài cho mỗi chap khi có thể, không cắt theo khổ A4. '
-                  'Quảng cáo được lọc trước khi lưu MHTML; quảng cáo in sẵn trong ảnh truyện sẽ không thể loại tự động. '
-                  'Hãy thử offline 1–2 chap trước.',
-                  foreground='#755215', wraplength=900).pack(anchor='w')
+        ttk.Button(controls,text='ĐỌC OFFLINE',command=self._read_offline).pack(side='right')
+        table_head=ttk.Frame(self.main)
+        table_head.pack(fill='x')
+        ttk.Label(table_head,text='Danh sách chương · chọn các chap cần tải',style='Header.TLabel').pack(side='left')
+        self.count_var=tk.StringVar(value='Chưa quét')
+        ttk.Label(table_head,textvariable=self.count_var,style='Muted.TLabel').pack(side='right')
+        actions=ttk.Frame(self.main)
+        actions.pack(fill='x',pady=(5,5))
+        ttk.Button(actions,text='Chọn tất cả',command=self._select_all).pack(side='left',padx=(0,5))
+        ttk.Button(actions,text='Bỏ chọn',command=self._select_none).pack(side='left',padx=(0,5))
+        ttk.Button(actions,text='Chọn khoảng',command=self._select_range).pack(side='left',padx=(0,5))
+        self.filter_var=tk.StringVar()
+        ttk.Label(actions,text='Lọc:').pack(side='left',padx=(14,4))
+        search=ttk.Entry(actions,textvariable=self.filter_var,width=25)
+        search.pack(side='left')
+        self.filter_var.trace_add('write',lambda *_:self._draw_chapters())
+        table_box=ttk.Frame(self.main)
+        table_box.pack(fill='both',expand=True)
+        self.table=ttk.Treeview(table_box,columns=('chosen','source','series','chap','status'),
+                               show='headings',selectmode='browse',height=9)
+        for col,label,width,anchor in [('chosen','Tải',50,'center'),('source','Website',150,'w'),
+                    ('series','Tên truyện',215,'w'),('chap','Chương',90,'center'),
+                    ('status','Trạng thái',180,'w')]:
+            self.table.heading(col,text=label)
+            self.table.column(col,width=width,minwidth=45,anchor=anchor,
+                              stretch=col in ('series','status'))
+        self.table.pack(side='left',fill='both',expand=True)
+        bar=ttk.Scrollbar(table_box,orient='vertical',command=self.table.yview)
+        bar.pack(side='right',fill='y')
+        self.table.configure(yscrollcommand=bar.set)
+        self.table.bind('<Button-1>',self._click_chapter)
+        self.status_var.set('Sẵn sàng — quét danh sách, chọn chap rồi tải')
+        ttk.Label(self.main,textvariable=self.status_var,style='Muted.TLabel').pack(anchor='w',pady=(7,2))
+        self.progress=ttk.Progressbar(self.main,mode='determinate')
+        self.progress.pack(fill='x',pady=(0,7))
+        ttk.Label(self.main,text='Nhật ký chi tiết',style='Header.TLabel').pack(anchor='w')
+        self.logs=scrolledtext.ScrolledText(self.main,height=8,font=('Consolas',9),
+                  state='disabled',wrap='word',relief='flat',padx=9,pady=7)
+        self.logs.pack(fill='both',expand=False,pady=(4,4))
+        ttk.Label(self.main,text='PDF tối ưu chiều rộng · kiểm tra MHTML · lưu tiến độ · phục hồi khi mất mạng. '
+                  'Nếu website chặn truy cập, ứng dụng sẽ báo lỗi thay vì vượt qua hạn chế.',
+                  style='Muted.TLabel',wraplength=970).pack(anchor='w',pady=(2,0))
+        self._change_theme(save=False)
 
+    def _paint_banner(self):
+        palette=THEMES.get(self.theme_var.get(), THEMES['Hsin • Moon Fox'])
+        self.banner.configure(bg=palette['banner'])
+        width=max(960,self.root.winfo_width()-40)
+        self.banner.delete('all')
+        try:
+            from PIL import Image, ImageTk
+            if self.theme_var.get().startswith('Hsin'):
+                import base64,io
+                src=asset_path('moon_fox_banner.png')
+                art=(src.read_bytes() if src.is_file() else
+                     base64.b64decode(MOON_FOX_BANNER_PNG_BASE64))
+                photo=Image.open(io.BytesIO(art)).convert('RGB')
+                photo=photo.resize((width,122),Image.Resampling.LANCZOS)
+                self._banner_photo=ImageTk.PhotoImage(photo)
+                self.banner.create_image(0,0,anchor='nw',image=self._banner_photo)
+        except Exception:
+            pass
+        color=palette['gold'] if self.theme_var.get().startswith('Hsin') else palette['text']
+        self.banner.create_text(25,35,text='TruyenSaver PRO',anchor='w',
+                                fill=color,font=('Segoe UI',23,'bold'))
+        self.banner.create_text(27,73,text=f'v{VERSION}   •   MOON FOX EDITION   •   CHROMIUM OFFLINE',
+                                anchor='w',fill=palette['muted'],font=('Segoe UI',10,'bold'))
+        self.banner.create_text(27,99,text='TẢI ỔN ĐỊNH   /   PDF DỄ ĐỌC   /   CHỌN CHAP TỰ DO',
+                                anchor='w',fill=color,font=('Segoe UI',9))
+
+    def _change_theme(self,event=None,save=True):
+        palette=THEMES.get(self.theme_var.get(),THEMES['Hsin • Moon Fox'])
+        apply_app_style(self.root,self.theme_var.get())
+        for widget in (self.links,self.logs):
+            widget.configure(background=palette['input'],foreground=palette['text'],
+                             insertbackground=palette['text'])
+        self._paint_banner()
+        if save:
+            try:self._save_settings()
+            except Exception:pass
+
+    def _draw_chapters(self):
+        term=self.filter_var.get().strip().casefold() if hasattr(self,'filter_var') else ''
+        for item in self.table.get_children():self.table.delete(item)
+        self.row_key_to_ref={}
+        for url,rec in self.scanned.items():
+            for chap in rec['chapters']:
+                ref=(url,chap['url'])
+                name='Chap '+chapter_label(chap['number'])
+                if term and term not in (' '.join((rec['title'],name,url))).casefold():continue
+                key=f'r{len(self.row_key_to_ref)}'
+                self.row_key_to_ref[key]=ref
+                self.table.insert('', 'end',iid=key,values=(
+                    '☑' if ref in self.scan_selection else '☐',
+                    urlsplit(url).hostname,rec['title'],name,
+                    self.chapter_states.get(ref,'Chưa tải')))
+        self._count_chapters()
+
+    def _count_chapters(self):
+        total=sum(len(v['chapters']) for v in self.scanned.values())
+        self.count_var.set(f'Đã chọn {len(self.scan_selection)} / {total} chap')
+
+    def _click_chapter(self,event):
+        row=self.table.identify_row(event.y)
+        col=self.table.identify_column(event.x)
+        if not row or col!='#1' or self.busy:return
+        ref=self.row_key_to_ref.get(row)
+        if not ref:return
+        if ref in self.scan_selection:self.scan_selection.discard(ref)
+        else:self.scan_selection.add(ref)
+        self.table.set(row,'chosen','☑' if ref in self.scan_selection else '☐')
+        self._count_chapters()
+
+    def _select_all(self):
+        if self.busy:return
+        self.scan_selection={(u,c['url']) for u,v in self.scanned.items() for c in v['chapters']}
+        self._draw_chapters()
+
+    def _select_none(self):
+        if self.busy:return
+        self.scan_selection.clear();self._draw_chapters()
+
+    def _select_range(self):
+        if self.busy:return
+        try:
+            lo=float(self.start_var.get().replace(',','.'))
+            hi=float(self.end_var.get().replace(',','.'))
+            if lo>hi:raise ValueError()
+        except ValueError:
+            messagebox.showerror('Khoảng chap','Nhập số chap bắt đầu và kết thúc hợp lệ.')
+            return
+        self.scan_selection={(u,c['url']) for u,v in self.scanned.items()
+                             for c in v['chapters'] if lo<=c['number']<=hi}
+        self._draw_chapters()
 
     def _load_settings(self):
-        for path in (SETTINGS, LEGACY_SETTINGS):
+        for path in (SETTINGS, PREVIOUS_SETTINGS, LEGACY_SETTINGS):
             try:
                 data = json.loads(path.read_text(encoding='utf-8'))
                 if isinstance(data, dict):
@@ -1203,7 +1403,8 @@ class App:
             'end': self.end_var.get().strip(),
             'links': self.links.get('1.0','end').strip(),
             'format': self.format_var.get(), 'workers': self.workers_var.get(),
-            'remove_ads': bool(self.ad_free_var.get())}, indent=2, ensure_ascii=False), encoding='utf-8')
+            'remove_ads': bool(self.ad_free_var.get()),
+            'theme': self.theme_var.get()}, indent=2, ensure_ascii=False), encoding='utf-8')
 
     def _choose_folder(self):
         path = filedialog.askdirectory(title='Chọn thư mục lưu truyện',
@@ -1261,6 +1462,18 @@ class App:
                     self.logs.insert('end', f'[{time.strftime("%H:%M:%S")}] {args[0]}\n')
                     self.logs.see('end')
                     self.logs.configure(state='disabled')
+                elif kind == 'scanned':
+                    source,title,chapters=args
+                    self.scanned[source]={'title':title,'chapters':chapters}
+                    self.scan_selection.update((source,c['url']) for c in chapters)
+                    self._draw_chapters()
+                elif kind == 'chapter_state':
+                    source,chapter_url,state=args
+                    self.chapter_states[(source,chapter_url)]=state
+                    for row,ref in self.row_key_to_ref.items():
+                        if ref==(source,chapter_url):
+                            self.table.set(row,'status',state)
+                            break
                 elif kind == 'progress':
                     current, total, message = args
                     self.progress.configure(maximum=max(1,total), value=current)
@@ -1351,9 +1564,14 @@ class App:
         self._run(action)
 
     def scan(self):
+        self.scanned.clear()
+        self.scan_selection.clear()
+        self.chapter_states.clear()
+        self._draw_chapters()
         self._run(self._scan)
 
     def download(self):
+        self.selection_snapshot = (set(self.scan_selection) if self.scanned else None)
         self._run(self._download)
 
     def _connect(self):
@@ -1361,19 +1579,60 @@ class App:
         port = self.browser.ensure(visible=False)
         return port, sync_playwright()
 
+    def _navigate_to_chapter(self, page, url):
+        """Fast navigation resilient to resources hanging forever on weak networks."""
+        from playwright.sync_api import TimeoutError as PWTimeout
+        self.host_health.wait(url,self.cancel)
+        if self.cancel.is_set():raise InterruptedError('Đã dừng')
+        try:
+            response=page.goto(url,wait_until='commit',timeout=21000)
+        except PWTimeout as error:
+            if self.cancel.is_set():raise InterruptedError('Đã dừng') from error
+            # Navigating can time out even if the page is already rendering.
+            current=page.url
+            live=False
+            try:
+                live=(urlsplit(current).path.rstrip('/')==urlsplit(url).path.rstrip('/')
+                      and bool(page.evaluate('Boolean(document.body && (document.images.length || document.querySelector("main,article")))')))
+            except Exception:pass
+            if not live:raise
+            self.log('Trang phản hồi chậm; đã thấy nội dung, tiếp tục kiểm tra ảnh.')
+            response=None
+        if response and response.status in (401,403):
+            raise PermissionError(f'Website yêu cầu đăng nhập hoặc từ chối HTTP {response.status}')
+        if response and response.status in (429,500,502,503,504):
+            raise RuntimeError(f'Website quá tải / giới hạn tốc độ HTTP {response.status}')
+        return response
+
     def _discover(self, page, url, start, end):
         self.log('Đang quét: '+url)
-        page.goto(url, wait_until='domcontentloaded', timeout=60000)
-        page.wait_for_timeout(700)
-        # Some pages lazy-render the chapter list.
-        try:
-            anchors = page.locator('a[href]').evaluate_all(
-                "els => els.map(a=>({href:a.href,text:(a.textContent||'').trim()}))")
-        except Exception as ex:
-            raise RuntimeError('Không đọc được danh sách chap: '+str(ex))
-        chapters = [c for c in extract_chapters(anchors, url) if start <= c['number'] <= end]
+        self._navigate_to_chapter(page,url)
+        # Don't assume a slow site finishes rendering chapter anchors in 700ms.
+        # Wait for actual chapter anchors; allow a small scroll to trigger lazy lists.
+        chapters=[]
+        steady=0
+        previous_size=-1
+        for attempt in range(26):
+            if self.cancel.is_set():raise InterruptedError('Đã dừng quét')
+            try:
+                anchors = page.locator('a[href]').evaluate_all(
+                    "els => els.map(a=>({href:a.href,text:(a.textContent||'').trim()}))")
+                chapters = [c for c in extract_chapters(anchors,url)
+                            if start <= c['number'] <= end]
+            except Exception as ex:
+                if attempt>=25:raise RuntimeError('Không đọc được danh sách chap: '+str(ex))
+            if chapters and len(chapters)==previous_size:
+                steady+=1
+            else:
+                steady=0
+            previous_size=len(chapters)
+            if chapters and steady>=3:break
+            if attempt==6:
+                try:page.evaluate('window.scrollBy(0, Math.max(500, innerHeight))')
+                except Exception:pass
+            page.wait_for_timeout(350)
         if not chapters:
-            raise RuntimeError('Không tìm được chap trong khoảng chọn. Kiểm tra lại link, đăng nhập hoặc cấu trúc website.')
+            raise RuntimeError('Không tìm được chap. Website có thể tải chậm, yêu cầu đăng nhập hoặc thay đổi cấu trúc.')
         try:
             title = page.locator('h1').first.text_content(timeout=2500) or ''
         except Exception:
@@ -1397,7 +1656,12 @@ class App:
                 for url in urls:
                     if self.cancel.is_set():
                         raise InterruptedError()
-                    self._discover(page, url, start, end)
+                    try:
+                        title, chapters = self._discover(page, url, 0, float('inf'))
+                        self._emit('scanned', url, title, chapters)
+                    except Exception as exc:
+                        self.log(f'Không quét được {url}: {exc}')
+                        if self.cancel.is_set():raise InterruptedError()
             finally:
                 page.close()
         return 'Đã quét xong'
@@ -1445,7 +1709,7 @@ class App:
                         raise InterruptedError('Đã yêu cầu dừng')
                     try:
                         self.log(f'Chap {number}: tải lượt {attempt+1}/3 ...')
-                        response=page.goto(url,wait_until='domcontentloaded',timeout=55000)
+                        response=self._navigate_to_chapter(page,url)
                         if response and response.status in (401,403):
                             raise RuntimeError(f'Website yêu cầu đăng nhập hoặc từ chối HTTP {response.status}')
                         if response and response.status in (429,500,502,503,504):
@@ -1463,6 +1727,7 @@ class App:
                                                  reader['urls'],ads_filtered=strip_ads)
                             if not completed(source_dir,number,url,archive,require_ad_free=strip_ads):
                                 raise RuntimeError('Chưa xác nhận được MHTML đã lưu')
+                            self.host_health.succeeded(url)
                             return True,f'Chap {number}: lưu MHTML đủ {check.matched} ảnh.'
                         pages=pdf_from_mhtml(blob,reader['urls'],target,self.cancel)
                         if self.cancel.is_set():
@@ -1470,20 +1735,23 @@ class App:
                         write_pdf_manifest(dest,number,url,target,len(reader['urls']),pages)
                         if not pdf_completed(dest,number,url,target):
                             raise RuntimeError('Chưa xác nhận được PDF đã lưu')
-                        return True,f'Chap {number}: PDF {pages} trang dài, {check.matched} ảnh.'
+                        self.host_health.succeeded(url)
+                        return True,f'Chap {number}: PDF {pages} trang, {check.matched} ảnh.'
                     except InterruptedError:
                         raise
                     except Exception as exc:
                         if self.cancel.is_set():
                             raise InterruptedError('Đã dừng toàn bộ tác vụ') from exc
                         self.log(f'Chap {number}: lỗi lượt {attempt+1}: {exc}')
+                        if isinstance(exc, PermissionError):
+                            raise  # Do not retry access-denied pages.
+                        delay=self.host_health.failed(url)
                         if attempt==2:
                             raise
-                        # Backoff prevents hammering a temporarily overloaded host.
-                        for _ in range((attempt+1)*4):
-                            if self.cancel.is_set():
-                                raise InterruptedError('Đã dừng')
-                            time.sleep(.5)
+                        self.log(f'    Mạng/trang phản hồi chậm: chờ {delay:.1f}s trước khi thử lại.')
+                        self.host_health.wait(url,self.cancel)
+                        try: page.goto('about:blank',wait_until='commit',timeout=5000)
+                        except Exception:pass
             finally:
                 try: page.close()
                 except Exception: pass
@@ -1506,11 +1774,23 @@ class App:
                     if self.cancel.is_set():
                         raise InterruptedError('Đã yêu cầu dừng')
                     try:
-                        title,chapters=self._discover(scan_page,series_url,start,end)
+                        if series_url in self.scanned:
+                            saved=self.scanned[series_url]
+                            title=saved['title']
+                            chapters=list(saved['chapters'])
+                        else:
+                            title,chapters=self._discover(scan_page,series_url,start,end)
                     except Exception as exc:
                         self.log(f'Không quét được {series_url}: {exc}')
                         results.append(series_url+': không tìm được chap')
                         continue
+                    # Honor per-chapter selection after a full scan.
+                    if self.scanned and series_url in self.scanned and self.selection_snapshot is not None:
+                        selected=self.selection_snapshot
+                        chapters=[c for c in chapters if (series_url,c['url']) in selected]
+                        if not chapters:
+                            self.log(f'{title}: không chọn chap nào; bỏ qua bộ truyện này.')
+                            continue
                     dest=root/sanitize(urlsplit(series_url).hostname or 'web')/title
                     dest.mkdir(parents=True,exist_ok=True)
                     combined=dest/combined_pdf_name(chapters)
@@ -1545,11 +1825,15 @@ class App:
                 while items or in_flight:
                     if self.cancel.is_set():
                         raise InterruptedError('Đã dừng tất cả chap')
-                    while items and len(in_flight) < workers and not self.cancel.is_set():
+                    # Reduce concurrency after repeated network failures on any active host.
+                    cap=1 if any(self.host_health.reduced_concurrency(spec['url'])
+                                 for spec,chap in items) else workers
+                    while items and len(in_flight) < cap and not self.cancel.is_set():
                         spec,chap=items.popleft()
                         future=pool.submit(self._process_chapter,port,spec['cache'],chap,
                                            mode,strip_ads,spec['dest'])
                         in_flight[future]=(spec,chap)
+                        self._emit('chapter_state',spec['url'],chap['url'],'Đang tải…')
                         with self._futures_lock:
                             self._futures.add(future)
                     if not in_flight:
@@ -1565,6 +1849,8 @@ class App:
                         try:
                             ok,message=future.result()
                             if ok: spec['done']+=1
+                            self._emit('chapter_state',spec['url'],chap['url'],
+                                       'Đã hoàn thành' if ok else 'Chưa hoàn thành')
                             self.log(spec['title']+': '+message)
                         except (InterruptedError,CancelledError):
                             self.cancel.set()
@@ -1572,6 +1858,7 @@ class App:
                         except Exception as exc:
                             item=f'Chap {number}: {exc}'
                             spec['failed'].append(item)
+                            self._emit('chapter_state',spec['url'],chap['url'],'Lỗi — thử lại sau')
                             self.log(spec['title']+': CHƯA HOÀN TẤT '+item)
                         finished+=1
                         self._emit('progress',finished,total,
@@ -1660,6 +1947,24 @@ def portable_self_test() -> int:
                     session.detach()
                 if 'multipart/related' not in blob:
                     raise RuntimeError('MHTML snapshot test failed')
+                # End-to-end test of real Chromium -> verified snapshot -> readable PDF.
+                import io,base64,tempfile
+                from PIL import Image
+                image=Image.new('RGB',(120,220),(183,81,105))
+                buffer=io.BytesIO();image.save(buffer,format='PNG')
+                data='data:image/png;base64,'+base64.b64encode(buffer.getvalue()).decode('ascii')
+                page.set_content('<html><body><div class="reading-detail">'+
+                                 '<img src="'+data+'"><img src="'+data+'"></div></body></html>')
+                expected=wait_for_reader(page,lambda message:None,__import__('threading').Event(),max_seconds=15)
+                snap,check=capture_verified_blob(page,expected,lambda message:None,strip_ads=False)
+                if not check.ok:
+                    raise RuntimeError('Offline MHTML validation failed')
+                with tempfile.TemporaryDirectory() as dirname:
+                    out=Path(dirname)/'check.pdf'
+                    pdf_from_mhtml(snap,expected['urls'],out)
+                    from pypdf import PdfReader
+                    if not out.is_file() or len(PdfReader(str(out)).pages)<1:
+                        raise RuntimeError('PDF conversion failed')
             finally:
                 page.close()
         return 0
@@ -1673,34 +1978,287 @@ def portable_self_test() -> int:
     finally:
         engine.close()
 
-def apply_app_style(root):
-    """Lightweight native Windows-style theme, no extra UI dependencies."""
-    theme=ttk.Style(root)
-    try:
-        theme.theme_use('clam')
-    except tk.TclError:
-        pass
-    background='#F5F7FB'
-    root.configure(background=background)
-    theme.configure('.',font=('Segoe UI',10))
-    theme.configure('TFrame',background=background)
-    theme.configure('TLabel',background=background,foreground='#1F2937')
-    theme.configure('TLabelframe',background=background,bordercolor='#D4DCE8')
-    theme.configure('TLabelframe.Label',background=background,foreground='#1B3A61',
-                    font=('Segoe UI',10,'bold'))
-    theme.configure('TButton',background='#E4EAF3',foreground='#26364C',
-                    borderwidth=0,padding=(12,8))
-    theme.map('TButton',background=[('active','#CCD8E8'),('disabled','#E9EDF2')],
-              foreground=[('disabled','#9BA8B9')])
-    theme.configure('Primary.TButton',background='#2167D9',foreground='#FFFFFF',
-                    borderwidth=0,padding=(18,9),font=('Segoe UI',10,'bold'))
-    theme.map('Primary.TButton',background=[('active','#174DA7'),('disabled','#AFC1DC')],
-              foreground=[('active','#FFFFFF')])
-    theme.configure('TEntry',fieldbackground='#FFFFFF',padding=(5,5))
-    theme.configure('TCombobox',fieldbackground='#FFFFFF',padding=(5,5))
-    theme.configure('TCheckbutton',background=background,foreground='#334155')
-    theme.configure('Horizontal.TProgressbar',background='#2475EC',
-                    troughcolor='#DEE5F0',borderwidth=0,thickness=10)
+# Theme artwork is original and embedded for a two-file GitHub update.
+MOON_FOX_BANNER_PNG_BASE64 = (
+    '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'
+    'AOhrq8Ng+LEOU/KLklwElSVFRXY1Nlr5YJlSKVJqR5V5OZKI/NQNKYOTUEob+9qEGUkAAAAAgCzn/N2x/pJk6JMzottQs/OSirwx'
+    '+3rVp7CuRZKipjYT9LX1CkESAAAAAKAWOXFP17OkSlWRImmp5UjHjs9anxFtR2sbAPTa7Tu3qAeP7N3f7E7QefS1hYC+thDQURUC'
+    'rkIppUduz2d3t4nBdG3rYUniI42qQKXlSC4Rkoi8/31vy/pWTlPbseOzt23foL9IOZKjdvW1CRVJANBnOkWKPQY80gOS0KBJrkIA'
+    'uAohWMZVqM384keOrAY3L2dvoXt/7xNll1inSHo0j+LS1AZrsavQIgRJANBTyeSILAkerZ9avn5qedO7CNT6qcn1U5NVn2Xd1OS6'
+    '6s/iXT3bbumLs3Zqcm31214zNbmmhS9OPduemZqcaeGLU9O2Bxl1QKklQpU2uBWeonYjAxmpoEjKsRZJRD74/uvFqqktWo7kaHpq'
+    'crqFf6x6jiAJAABUhSwpR6VZUhtTkqhK99/2F6fSLKmNEVJUpXFJGyOkKMf9F4zcNklJUrMk8+zJQmFJVC0uvO6/r+3Fl45XmiLl'
+    'NLUlufS1ESG1FEESAADw75WTp0RkfGRUfcqApKhXTp6u50SvnjwtkY6qVgxIerXeF6c2kz5uOf9aXXv+Xr0vjhcme17m4yocbuGL'
+    'U9+es1Kb/K9XmiXlnL1ec/624R4hTYyNqRTpv/6PZ5LfTU2RNL/lSMqRFv6xcqf72lo3IEkIkgCgt5LTtZm3Db9UljSzfFnTGwmR'
+    'ypIqKkpSFTc1ByUeqZ1XVDfU9hdHZUkVFSWpcqQ2pkiK2nlFdUPqsG1MkZTDPl6czKIkFffkByX5wVBOYOQrS2ooTlLlSL5SJC+F'
+    'SLJYi5QqazRS1p3a3MuR+pkitR1BEgD0VzQ5IkVCFQ6fOiNkSRkqypLaHpQoFWVJ3XhxKsqS2p4iKV7ikqS2p0hKRS+OUYokkeeU'
+    'HZaUXGKtoSzJY4rk5Th337VZPfj8F5/Lek7WaCQR8VWORIrUam0dEg4A8IL8CNXR92ubnbu4fmq5KlBC0vqpSV/NbsnkpV19bUnr'
+    'piZ95T4NjkaKXgWP83bXTk36anZr+2ikpJmpyVjuY93X1vbRSEn6xXlgz66ya8+dObt02cSlz+3+Dz0YznTmFwd1JwOX+cVTpH7X'
+    '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'
+    'RK5CYII='
+)
+
+THEMES = {
+    'Hsin • Moon Fox': {'bg':'#17151B','input':'#28232C','text':'#F5E8E1',
+                        'muted':'#C9ABA0','accent':'#AA384A','active':'#D15262',
+                        'gold':'#F1D09C','banner':'#211723','border':'#44333E'},
+    'Tối': {'bg':'#151B25','input':'#242C37','text':'#EFF4FC',
+             'muted':'#A9B8CA','accent':'#305F9D','active':'#437CC9',
+             'gold':'#E3EFFF','banner':'#1B2737','border':'#3D4C61'},
+    'Sáng': {'bg':'#F5F7FA','input':'#FFFFFF','text':'#1A2D3F',
+              'muted':'#526880','accent':'#2167D9','active':'#3D7BE4',
+              'gold':'#153B6B','banner':'#DFE9F6','border':'#CDD7E4'},
+}
+
+
+def apply_app_style(root, name='Hsin • Moon Fox'):
+    pal=THEMES.get(name,THEMES['Hsin • Moon Fox'])
+    style=ttk.Style(root)
+    try:style.theme_use('clam')
+    except tk.TclError:pass
+    root.configure(background=pal['bg'])
+    style.configure('.',font=('Segoe UI',10),background=pal['bg'],foreground=pal['text'])
+    style.configure('TFrame',background=pal['bg'])
+    style.configure('TLabel',background=pal['bg'],foreground=pal['text'])
+    style.configure('Muted.TLabel',background=pal['bg'],foreground=pal['muted'],font=('Segoe UI',9))
+    style.configure('Header.TLabel',background=pal['bg'],foreground=pal['gold'],font=('Segoe UI',10,'bold'))
+    style.configure('TButton',padding=(10,7),background=pal['input'],foreground=pal['text'],borderwidth=0)
+    style.map('TButton',background=[('active',pal['border']),('disabled',pal['input'])])
+    style.configure('Primary.TButton',padding=(14,8),background=pal['accent'],foreground='#FFFFFF',
+                    borderwidth=0,font=('Segoe UI',10,'bold'))
+    style.map('Primary.TButton',background=[('active',pal['active']),('disabled',pal['border'])])
+    style.configure('Stop.TButton',padding=(12,8),background='#6F2936',foreground='#FFFFFF')
+    style.map('Stop.TButton',background=[('active','#A13747'),('disabled',pal['input'])])
+    style.configure('TEntry',fieldbackground=pal['input'],foreground=pal['text'],
+                    insertcolor=pal['text'],padding=(5,5),borderwidth=0)
+    style.configure('TCombobox',fieldbackground=pal['input'],background=pal['input'],
+                    foreground=pal['text'],arrowcolor=pal['gold'],padding=(5,4))
+    style.map('TCombobox',fieldbackground=[('readonly',pal['input'])],
+              foreground=[('readonly',pal['text'])])
+    style.configure('TCheckbutton',background=pal['bg'],foreground=pal['text'])
+    style.configure('Treeview',background=pal['input'],fieldbackground=pal['input'],foreground=pal['text'],
+                    rowheight=26,borderwidth=0,font=('Segoe UI',10))
+    style.configure('Treeview.Heading',background=pal['border'],foreground=pal['gold'],
+                    font=('Segoe UI',9,'bold'),relief='flat')
+    style.map('Treeview',background=[('selected',pal['accent'])],foreground=[('selected','#FFFFFF')])
+    style.configure('Horizontal.TProgressbar',background=pal['accent'],troughcolor=pal['border'],
+                    borderwidth=0,thickness=10)
 
 
 if __name__ == '__main__':
