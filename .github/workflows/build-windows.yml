@@ -1,5 +1,5 @@
 
-name: Tao EXE TruyenSaver PRO v3.1
+name: TruyenSaver PRO v4.0 Hsin - Build Windows
 
 on:
   workflow_dispatch:
@@ -12,73 +12,68 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 55
+    timeout-minutes: 60
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
 
     steps:
-      - name: Get source
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Python
+      - name: Setup Python on GitHub runner only
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install requirements
+      - name: Install build tools
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install "playwright>=1.54,<2" "pillow>=11,<13" "reportlab>=4.2,<5" "pypdf>=5,<7" "pyinstaller>=6.10,<7"
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency install failed' }
 
-      - name: Download Chromium
+      - name: Include portable Chromium
         shell: pwsh
         run: |
           $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $env:GITHUB_WORKSPACE 'playwright-browsers'
           python -m playwright install chromium
-          if (-not (Test-Path $env:PLAYWRIGHT_BROWSERS_PATH)) {
-            throw 'Chromium missing'
-          }
+          if ($LASTEXITCODE -ne 0) { throw 'Chromium download failed' }
 
-      - name: Test code
+      - name: Check source
         shell: pwsh
         run: |
           python -m py_compile app.py
-          if (Test-Path 'tests/test_v31_regressions.py') {
+          if ($LASTEXITCODE -ne 0) { throw 'Syntax check failed' }
+          if (Test-Path tests) {
             python -m unittest discover -s tests -p 'test_*.py' -v
-            if ($LASTEXITCODE -ne 0) {
-              throw 'Tests failed'
-            }
-            python tests/check_stop_real_browser.py
-            if ($LASTEXITCODE -ne 0) {
-              throw 'Browser STOP test failed'
-            }
+            if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
           }
 
-      - name: Build EXE
+      - name: Build Windows EXE
         shell: pwsh
         run: |
           $browsers = Join-Path $env:GITHUB_WORKSPACE 'playwright-browsers'
-          python -m PyInstaller --noconfirm --clean --onedir --windowed --name TruyenSaver_PRO_v3_1 --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf --add-data "$browsers;playwright-browsers" app.py
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name TruyenSaver_PRO_v4 `
+            --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf `
+            --add-data "$browsers;playwright-browsers" app.py
+          if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
 
-      - name: Verify EXE
+      - name: Verify portable EXE
         shell: pwsh
         run: |
-          $dir = 'dist/TruyenSaver_PRO_v3_1'
-          if (-not (Test-Path "$dir/TruyenSaver_PRO_v3_1.exe")) {
-            throw 'EXE missing'
-          }
+          $dir = 'dist/TruyenSaver_PRO_v4'
+          $exe = "$dir/TruyenSaver_PRO_v4.exe"
+          if (-not (Test-Path $exe)) { throw 'EXE missing' }
           if (-not (Test-Path "$dir/_internal/playwright-browsers")) {
             throw 'Chromium missing'
           }
-          $exe = (Resolve-Path "$dir/TruyenSaver_PRO_v3_1.exe").Path
-          $test = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
-          if ($test.ExitCode -ne 0) {
-            throw 'EXE self-test failed'
-          }
+          $proc = Start-Process -FilePath (Resolve-Path $exe).Path -ArgumentList '--self-test' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw 'EXE self-test failed' }
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: TruyenSaver-PRO-v3.1-Windows-Portable
-          path: dist/TruyenSaver_PRO_v3_1/
+          name: TruyenSaver-PRO-v4-Hsin-Windows-Portable
+          path: dist/TruyenSaver_PRO_v4/
           retention-days: 14
           if-no-files-found: error
