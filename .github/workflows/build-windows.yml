@@ -22,17 +22,36 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $source = 'TruyenSaver_PRO_v4_1_DamCoNuong_Source.zip'
-          if (!(Test-Path $source)) {
-            throw "Không tìm thấy $source trong thư mục gốc repository"
+          $sourceName = 'TruyenSaver_PRO_v4_1_DamCoNuong_Source.zip'
+          $sourcePath = $sourceName
+
+          if (!(Test-Path $sourcePath)) {
+            $outerZip = Get-ChildItem -Path . -Filter '*GitHub_2File.zip' -File | Select-Object -First 1
+
+            if (!$outerZip) {
+              throw 'Không tìm thấy Source.zip hoặc GitHub_2File.zip trong repository'
+            }
+
+            Write-Host "Đang mở bộ GitHub: $($outerZip.Name)"
+            Expand-Archive -LiteralPath $outerZip.FullName -DestinationPath '_bundle' -Force
+            $sourcePath = Join-Path '_bundle' $sourceName
           }
-          Expand-Archive -LiteralPath $source -DestinationPath source -Force
+
+          if (!(Test-Path $sourcePath)) {
+            throw "Không tìm thấy $sourceName bên trong bộ ZIP"
+          }
+
+          Expand-Archive -LiteralPath $sourcePath -DestinationPath source -Force
+
           if (!(Test-Path 'source/app.py')) {
-            throw 'Không tìm thấy app.py trong ZIP'
+            throw 'Không tìm thấy app.py'
           }
+
           if (!(Test-Path 'source/tests')) {
-            throw 'Thiếu thư mục tests trong ZIP'
+            throw 'Thiếu thư mục tests'
           }
+
+          Write-Host 'Giải nén mã nguồn thành công'
 
       - name: Setup Python on Windows runner
         uses: actions/setup-python@v5
@@ -47,6 +66,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Upgrade pip failed'
           }
+
           python -m pip install -r requirements-build.txt
           if ($LASTEXITCODE -ne 0) {
             throw 'Install dependencies failed'
@@ -60,6 +80,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Chromium installation failed'
           }
+
           if (!(Test-Path $env:PLAYWRIGHT_BROWSERS_PATH)) {
             throw 'Chromium files missing'
           }
@@ -72,10 +93,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Python syntax invalid'
           }
+
           python -m unittest discover -s tests -p 'test_*.py' -v
           if ($LASTEXITCODE -ne 0) {
             throw 'Regression tests failed'
           }
+
           python tests/check_stop_real_browser.py
           if ($LASTEXITCODE -ne 0) {
             throw 'Chromium stop test failed'
@@ -87,11 +110,13 @@ jobs:
         run: |
           $browserDir = Join-Path $env:GITHUB_WORKSPACE 'playwright-browsers'
           $distDir = Join-Path $env:GITHUB_WORKSPACE 'dist'
+
           python -m PyInstaller --noconfirm --clean --onedir --windowed `
             --name TruyenSaver_PRO_Classic `
             --distpath "$distDir" `
             --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf `
             --add-data "$browserDir;playwright-browsers" app.py
+
           if ($LASTEXITCODE -ne 0) {
             throw 'PyInstaller build failed'
           }
@@ -102,13 +127,17 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $dir = Join-Path $env:GITHUB_WORKSPACE 'dist/TruyenSaver_PRO_Classic'
           $exe = Join-Path $dir 'TruyenSaver_PRO_Classic.exe'
+
           if (!(Test-Path $exe)) {
             throw 'Windows EXE missing'
           }
+
           if (!(Test-Path (Join-Path $dir '_internal/playwright-browsers'))) {
             throw 'Bundled browser missing'
           }
+
           $proc = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
+
           if ($proc.ExitCode -ne 0) {
             $err = Join-Path $env:TEMP 'TruyenSaver_PRO_selftest_error.txt'
             if (Test-Path $err) {
@@ -116,6 +145,7 @@ jobs:
             }
             throw "Portable EXE self-test failed ($($proc.ExitCode))"
           }
+
           Write-Host 'EXE self-test passed'
 
       - name: Publish portable download
