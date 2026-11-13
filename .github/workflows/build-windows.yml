@@ -22,36 +22,77 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $sourceName = 'TruyenSaver_PRO_v4_1_DamCoNuong_Source.zip'
-          $sourcePath = $sourceName
+          $root = $env:GITHUB_WORKSPACE
+          $target = Join-Path $root 'source'
+          New-Item -ItemType Directory -Path $target -Force | Out-Null
 
-          if (!(Test-Path $sourcePath)) {
-            $outerZip = Get-ChildItem -Path . -Filter '*GitHub_2File.zip' -File | Select-Object -First 1
+          $archives = @(Get-ChildItem -LiteralPath $root -Filter '*.zip' -File)
+          if ($archives.Count -eq 0) {
+            throw 'Repository chua co file ZIP nao o thu muc goc'
+          }
 
-            if (!$outerZip) {
-              throw 'Không tìm thấy Source.zip hoặc GitHub_2File.zip trong repository'
+          $queue = [System.Collections.Generic.Queue[string]]::new()
+          foreach ($file in $archives) {
+            $queue.Enqueue($file.FullName)
+          }
+
+          $processed = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+          )
+          $found = $false
+          $attempt = 0
+
+          while ($queue.Count -gt 0 -and $attempt -lt 20 -and !$found) {
+            $archive = $queue.Dequeue()
+            if (-not $processed.Add($archive)) {
+              continue
             }
 
-            Write-Host "Đang mở bộ GitHub: $($outerZip.Name)"
-            Expand-Archive -LiteralPath $outerZip.FullName -DestinationPath '_bundle' -Force
-            $sourcePath = Join-Path '_bundle' $sourceName
+            $attempt++
+            $destination = Join-Path $root "_unpack_$attempt"
+
+            Write-Host "Dang giai nen: $archive"
+            Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
+
+            $apps = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Filter 'app.py')
+
+            foreach ($app in $apps) {
+              $folder = $app.DirectoryName
+              $requirements = Join-Path $folder 'requirements-build.txt'
+              $tests = Join-Path $folder 'tests'
+
+              if ((Test-Path $requirements) -and (Test-Path $tests)) {
+                Copy-Item -Path (Join-Path $folder '*') -Destination $target -Recurse -Force
+                Write-Host "Tim thay ma nguon tai: $folder"
+                $found = $true
+                break
+              }
+            }
+
+            if (-not $found) {
+              $nested = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Filter '*.zip')
+
+              foreach ($file in $nested) {
+                Write-Host "Phat hien ZIP ben trong: $($file.Name)"
+                $queue.Enqueue($file.FullName)
+              }
+            }
           }
 
-          if (!(Test-Path $sourcePath)) {
-            throw "Không tìm thấy $sourceName bên trong bộ ZIP"
+          if (-not $found) {
+            Write-Host 'Cac file da tim thay:'
+            Get-ChildItem -LiteralPath $root -Directory -Filter '_unpack_*' | ForEach-Object {
+              Get-ChildItem -LiteralPath $_.FullName -File -Recurse |
+                Select-Object -First 40 -ExpandProperty FullName |
+                ForEach-Object { Write-Host $_ }
+            }
+            throw 'Khong tim thay bo ma nguon co app.py, requirements-build.txt va tests'
           }
 
-          Expand-Archive -LiteralPath $sourcePath -DestinationPath source -Force
-
-          if (!(Test-Path 'source/app.py')) {
-            throw 'Không tìm thấy app.py'
+          if (!(Test-Path (Join-Path $target 'app.py'))) {
+            throw 'Thieu app.py sau khi copy'
           }
-
-          if (!(Test-Path 'source/tests')) {
-            throw 'Thiếu thư mục tests'
-          }
-
-          Write-Host 'Giải nén mã nguồn thành công'
+          Write-Host 'Da tim va giai nen ma nguon thanh cong'
 
       - name: Setup Python on Windows runner
         uses: actions/setup-python@v5
