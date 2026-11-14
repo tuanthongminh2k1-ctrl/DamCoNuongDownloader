@@ -22,7 +22,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $name = 'TruyenSaver_PRO_v5_1_Source.zip'
+          $name = 'TruyenSaver_v5_1_1_FIX_AnhNho_TaiLai.zip'
           $zip = Join-Path $env:GITHUB_WORKSPACE $name
           if (!(Test-Path $zip)) {
             $wrappers = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Filter '*.zip' -File)
