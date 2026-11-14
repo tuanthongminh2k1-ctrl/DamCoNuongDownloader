@@ -1,5 +1,5 @@
 
-name: TruyenSaver PRO v5 - Verified Chapters - Windows
+name: TruyenSaver PRO v5.1 - Domain Settings and Original Images - Windows
 
 on:
   workflow_dispatch:
@@ -18,11 +18,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract v5 source (including nested package)
+      - name: Extract v5.1 source (including nested package)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $name = 'TruyenSaver_PRO_v5_Source.zip'
+          $name = 'TruyenSaver_PRO_v5_1_Source.zip'
           $zip = Join-Path $env:GITHUB_WORKSPACE $name
           if (!(Test-Path $zip)) {
             $wrappers = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Filter '*.zip' -File)
@@ -39,16 +39,16 @@ jobs:
           if (!(Test-Path $zip)) {
             Write-Host 'Root repository files:'
             Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -File | Select-Object -ExpandProperty Name
-            throw "Khong tim thay $name. Can upload ZIP v5, khong phai ban v4.1."
+            throw "Khong tim thay $name. Can upload ZIP v5.1, khong phai ban v5 cu."
           }
           Expand-Archive -LiteralPath $zip -DestinationPath source -Force
           if (!(Test-Path 'source/app.py') -or !(Test-Path 'source/chapter_v5.py')) {
-            throw 'ZIP v5 sai cau truc; can app.py va chapter_v5.py tai thu muc goc trong ZIP'
+            throw 'ZIP v5.1 sai cau truc; can app.py va chapter_v5.py tai thu muc goc trong ZIP'
           }
           if (!(Test-Path 'source/tests') -or !(Test-Path 'source/requirements-build.txt')) {
-            throw 'ZIP v5 thieu tests hoac requirements-build.txt'
+            throw 'ZIP v5.1 thieu tests hoac requirements-build.txt'
           }
-          Write-Host 'V5 source extracted and checked.'
+          Write-Host 'V5.1 source extracted and checked.'
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
@@ -90,7 +90,7 @@ jobs:
           $browser = Join-Path $env:GITHUB_WORKSPACE 'playwright-browsers'
           $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
           python -m PyInstaller --noconfirm --clean --onedir --windowed `
-            --name TruyenSaver_PRO_v5 --distpath "$dist" `
+            --name TruyenSaver_PRO_v5_1 --distpath "$dist" `
             --hidden-import chapter_v5 `
             --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf `
             --add-data "$browser;playwright-browsers" --add-data "assets;assets" app.py
@@ -100,8 +100,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $folder = Join-Path $env:GITHUB_WORKSPACE 'dist/TruyenSaver_PRO_v5'
-          $exe = Join-Path $folder 'TruyenSaver_PRO_v5.exe'
+          $folder = Join-Path $env:GITHUB_WORKSPACE 'dist/TruyenSaver_PRO_v5_1'
+          $exe = Join-Path $folder 'TruyenSaver_PRO_v5_1.exe'
           if (!(Test-Path $exe)) { throw 'EXE missing' }
           if (!(Test-Path (Join-Path $folder '_internal/playwright-browsers'))) {
             throw 'Bundled Chromium missing'
@@ -117,7 +117,7 @@ jobs:
       - name: Upload Windows Portable
         uses: actions/upload-artifact@v4
         with:
-          name: TruyenSaver-PRO-v5-Windows-Portable
-          path: dist/TruyenSaver_PRO_v5/
+          name: TruyenSaver-PRO-v5_1-Windows-Portable
+          path: dist/TruyenSaver_PRO_v5_1/
           retention-days: 14
           if-no-files-found: error
