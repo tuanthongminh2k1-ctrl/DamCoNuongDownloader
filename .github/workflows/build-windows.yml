@@ -1,5 +1,5 @@
 
-name: TruyenSaver PRO v4.1 DamCoNuong Optimized - Windows
+name: TruyenSaver PRO v5 - Verified Chapters - Windows
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  build-windows:
+  windows-portable:
     runs-on: windows-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/playwright-browsers
 
@@ -18,181 +18,106 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Unpack classic source
+      - name: Extract v5 source (including nested package)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $root = $env:GITHUB_WORKSPACE
-          $target = Join-Path $root 'source'
-          New-Item -ItemType Directory -Path $target -Force | Out-Null
-
-          $archives = @(Get-ChildItem -LiteralPath $root -Filter '*.zip' -File)
-          if ($archives.Count -eq 0) {
-            throw 'Repository chua co file ZIP nao o thu muc goc'
-          }
-
-          $queue = [System.Collections.Generic.Queue[string]]::new()
-          foreach ($file in $archives) {
-            $queue.Enqueue($file.FullName)
-          }
-
-          $processed = [System.Collections.Generic.HashSet[string]]::new(
-            [System.StringComparer]::OrdinalIgnoreCase
-          )
-          $found = $false
-          $attempt = 0
-
-          while ($queue.Count -gt 0 -and $attempt -lt 20 -and !$found) {
-            $archive = $queue.Dequeue()
-            if (-not $processed.Add($archive)) {
-              continue
-            }
-
-            $attempt++
-            $destination = Join-Path $root "_unpack_$attempt"
-
-            Write-Host "Dang giai nen: $archive"
-            Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
-
-            $apps = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Filter 'app.py')
-
-            foreach ($app in $apps) {
-              $folder = $app.DirectoryName
-              $requirements = Join-Path $folder 'requirements-build.txt'
-              $tests = Join-Path $folder 'tests'
-
-              if ((Test-Path $requirements) -and (Test-Path $tests)) {
-                Copy-Item -Path (Join-Path $folder '*') -Destination $target -Recurse -Force
-                Write-Host "Tim thay ma nguon tai: $folder"
-                $found = $true
+          $name = 'TruyenSaver_PRO_v5_Source.zip'
+          $zip = Join-Path $env:GITHUB_WORKSPACE $name
+          if (!(Test-Path $zip)) {
+            $wrappers = @(Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Filter '*.zip' -File)
+            foreach ($wrapper in $wrappers) {
+              $dest = Join-Path $env:GITHUB_WORKSPACE ('wrapper-' + $wrapper.BaseName)
+              Expand-Archive -LiteralPath $wrapper.FullName -DestinationPath $dest -Force
+              $candidate = Get-ChildItem -LiteralPath $dest -Filter $name -Recurse -File | Select-Object -First 1
+              if ($candidate) {
+                $zip = $candidate.FullName
                 break
               }
             }
-
-            if (-not $found) {
-              $nested = @(Get-ChildItem -LiteralPath $destination -Recurse -File -Filter '*.zip')
-
-              foreach ($file in $nested) {
-                Write-Host "Phat hien ZIP ben trong: $($file.Name)"
-                $queue.Enqueue($file.FullName)
-              }
-            }
           }
-
-          if (-not $found) {
-            Write-Host 'Cac file da tim thay:'
-            Get-ChildItem -LiteralPath $root -Directory -Filter '_unpack_*' | ForEach-Object {
-              Get-ChildItem -LiteralPath $_.FullName -File -Recurse |
-                Select-Object -First 40 -ExpandProperty FullName |
-                ForEach-Object { Write-Host $_ }
-            }
-            throw 'Khong tim thay bo ma nguon co app.py, requirements-build.txt va tests'
+          if (!(Test-Path $zip)) {
+            Write-Host 'Root repository files:'
+            Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -File | Select-Object -ExpandProperty Name
+            throw "Khong tim thay $name. Can upload ZIP v5, khong phai ban v4.1."
           }
-
-          if (!(Test-Path (Join-Path $target 'app.py'))) {
-            throw 'Thieu app.py sau khi copy'
+          Expand-Archive -LiteralPath $zip -DestinationPath source -Force
+          if (!(Test-Path 'source/app.py') -or !(Test-Path 'source/chapter_v5.py')) {
+            throw 'ZIP v5 sai cau truc; can app.py va chapter_v5.py tai thu muc goc trong ZIP'
           }
-          Write-Host 'Da tim va giai nen ma nguon thanh cong'
+          if (!(Test-Path 'source/tests') -or !(Test-Path 'source/requirements-build.txt')) {
+            throw 'ZIP v5 thieu tests hoac requirements-build.txt'
+          }
+          Write-Host 'V5 source extracted and checked.'
 
-      - name: Setup Python on Windows runner
+      - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install tools
+      - name: Install dependencies
         shell: pwsh
         working-directory: source
         run: |
           python -m pip install --upgrade pip
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Upgrade pip failed'
-          }
-
+          if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
           python -m pip install -r requirements-build.txt
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Install dependencies failed'
-          }
+          if ($LASTEXITCODE -ne 0) { throw 'dependency install failed' }
 
-      - name: Download Chromium for portable application
+      - name: Install bundled Chromium
         shell: pwsh
         working-directory: source
         run: |
           python -m playwright install chromium
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Chromium installation failed'
-          }
+          if ($LASTEXITCODE -ne 0) { throw 'Chromium download failed' }
+          if (!(Test-Path $env:PLAYWRIGHT_BROWSERS_PATH)) { throw 'Browser directory missing' }
 
-          if (!(Test-Path $env:PLAYWRIGHT_BROWSERS_PATH)) {
-            throw 'Chromium files missing'
-          }
-
-      - name: Validate source and run regression tests
+      - name: Run all regression tests including v5 sequential images
         shell: pwsh
         working-directory: source
         run: |
-          python -m py_compile app.py
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Python syntax invalid'
-          }
-
+          python -m py_compile app.py chapter_v5.py
+          if ($LASTEXITCODE -ne 0) { throw 'Python syntax check failed' }
           python -m unittest discover -s tests -p 'test_*.py' -v
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Regression tests failed'
-          }
-
+          if ($LASTEXITCODE -ne 0) { throw 'Regression tests failed' }
           python tests/check_stop_real_browser.py
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Chromium stop test failed'
-          }
+          if ($LASTEXITCODE -ne 0) { throw 'STOP smoke test failed' }
 
-      - name: Build Windows portable EXE
+      - name: Build Windows Portable EXE
         shell: pwsh
         working-directory: source
         run: |
-          $browserDir = Join-Path $env:GITHUB_WORKSPACE 'playwright-browsers'
-          $distDir = Join-Path $env:GITHUB_WORKSPACE 'dist'
-
+          $browser = Join-Path $env:GITHUB_WORKSPACE 'playwright-browsers'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
           python -m PyInstaller --noconfirm --clean --onedir --windowed `
-            --name TruyenSaver_PRO_Classic `
-            --distpath "$distDir" `
+            --name TruyenSaver_PRO_v5 --distpath "$dist" `
+            --hidden-import chapter_v5 `
             --collect-all playwright --collect-all PIL --collect-all reportlab --collect-all pypdf `
-            --add-data "$browserDir;playwright-browsers" app.py
+            --add-data "$browser;playwright-browsers" --add-data "assets;assets" app.py
+          if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed' }
 
-          if ($LASTEXITCODE -ne 0) {
-            throw 'PyInstaller build failed'
-          }
-
-      - name: Test built EXE with bundled browser
+      - name: Smoke-test bundled EXE and original-image PDF pipeline
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $dir = Join-Path $env:GITHUB_WORKSPACE 'dist/TruyenSaver_PRO_Classic'
-          $exe = Join-Path $dir 'TruyenSaver_PRO_Classic.exe'
-
-          if (!(Test-Path $exe)) {
-            throw 'Windows EXE missing'
+          $folder = Join-Path $env:GITHUB_WORKSPACE 'dist/TruyenSaver_PRO_v5'
+          $exe = Join-Path $folder 'TruyenSaver_PRO_v5.exe'
+          if (!(Test-Path $exe)) { throw 'EXE missing' }
+          if (!(Test-Path (Join-Path $folder '_internal/playwright-browsers'))) {
+            throw 'Bundled Chromium missing'
           }
-
-          if (!(Test-Path (Join-Path $dir '_internal/playwright-browsers'))) {
-            throw 'Bundled browser missing'
+          $result = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
+          if ($result.ExitCode -ne 0) {
+            $log = Join-Path $env:TEMP 'TruyenSaver_PRO_selftest_error.txt'
+            if (Test-Path $log) { Get-Content $log }
+            throw "Bundled EXE self-test failed ($($result.ExitCode))"
           }
+          Write-Host 'EXE browser and chapter image/PDF smoke test OK'
 
-          $proc = Start-Process -FilePath $exe -ArgumentList '--self-test' -Wait -PassThru
-
-          if ($proc.ExitCode -ne 0) {
-            $err = Join-Path $env:TEMP 'TruyenSaver_PRO_selftest_error.txt'
-            if (Test-Path $err) {
-              Get-Content $err
-            }
-            throw "Portable EXE self-test failed ($($proc.ExitCode))"
-          }
-
-          Write-Host 'EXE self-test passed'
-
-      - name: Publish portable download
+      - name: Upload Windows Portable
         uses: actions/upload-artifact@v4
         with:
-          name: TruyenSaver-v4.1-DamCoNuong-Windows-Portable
-          path: dist/TruyenSaver_PRO_Classic/
+          name: TruyenSaver-PRO-v5-Windows-Portable
+          path: dist/TruyenSaver_PRO_v5/
           retention-days: 14
           if-no-files-found: error
